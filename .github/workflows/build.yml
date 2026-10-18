@@ -1,4 +1,4 @@
-name: Build Battery Line APK
+name: Build Walkman Custom Remote APK
 
 on:
   push:
@@ -26,7 +26,8 @@ jobs:
 
       - name: Generate Source Code
         run: |
-          mkdir -p app/src/main/java/com/walkman/batteryline
+          mkdir -p app/src/main/java/com/walkman/remote
+          mkdir -p app/src/main/res/values
 
           cat << 'EOF' > settings.gradle
           pluginManagement {
@@ -43,7 +44,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "BatteryLine"
+          rootProject.name = "WalkmanRemote"
           include ':app'
           EOF
 
@@ -61,11 +62,11 @@ jobs:
           }
 
           android {
-              namespace 'com.walkman.batteryline'
+              namespace 'com.walkman.remote'
               compileSdk 34
 
               defaultConfig {
-                  applicationId "com.walkman.batteryline"
+                  applicationId "com.walkman.remote"
                   minSdk 26
                   targetSdk 33
                   versionCode 1
@@ -85,183 +86,848 @@ jobs:
                   jvmTarget = '17'
               }
           }
+
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/styles.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.WalkmanRemote" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <item name="android:windowBackground">#000000</item>
+                  <item name="android:statusBarColor">#000000</item>
+                  <item name="android:navigationBarColor">#000000</item>
+              </style>
+          </resources>
           EOF
 
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
               <application
-                  android:label="Battery Line"
-                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  android:label="Walkman Remote"
+                  android:theme="@style/Theme.WalkmanRemote"
+                  android:icon="@android:drawable/ic_media_play">
+
                   <activity
                       android:name=".MainActivity"
-                      android:exported="true">
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
                   <service
-                      android:name=".BatteryService"
-                      android:exported="false" />
+                      android:name=".WalkmanNotificationListener"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
               </application>
           </manifest>
           EOF
 
-          cat << 'EOF' > app/src/main/java/com/walkman/batteryline/MainActivity.kt
-          package com.walkman.batteryline
+          cat << 'EOF' > app/src/main/java/com/walkman/remote/MainActivity.kt
+          package com.walkman.remote
 
           import android.app.Activity
+          import android.content.ComponentName
+          import android.content.Context
           import android.content.Intent
-          import android.net.Uri
           import android.os.Bundle
           import android.provider.Settings
+          import android.view.View
+          import android.view.WindowInsets
+          import android.view.WindowInsetsController
+          import android.view.WindowManager
 
           class MainActivity : Activity() {
+
+              private lateinit var remoteView: WalkmanRemoteView
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  if (!Settings.canDrawOverlays(this)) {
-                      val intent = Intent(
-                          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                          Uri.parse("package:$packageName")
-                      )
-                      startActivityForResult(intent, 100)
+
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  hideSystemUI()
+
+                  remoteView = WalkmanRemoteView(this)
+                  setContentView(remoteView)
+
+                  checkNotificationPermission()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  hideSystemUI()
+                  WalkmanNotificationListener.instance?.bindActiveSession()
+              }
+
+              private fun hideSystemUI() {
+                  if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                      window.insetsController?.let {
+                          it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                          it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                      }
                   } else {
-                      startService()
-                      finish()
+                      @Suppress("DEPRECATION")
+                      window.decorView.systemUiVisibility = (
+                          View.SYSTEM_UI_FLAG_FULLSCREEN
+                          or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                          or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      )
                   }
               }
 
-              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-                  super.onActivityResult(requestCode, resultCode, data)
-                  if (Settings.canDrawOverlays(this)) {
-                      startService()
+              private fun checkNotificationPermission() {
+                  val enabledListeners = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+                  val myComponent = ComponentName(this, WalkmanNotificationListener::class.java).flattenToString()
+                  if (enabledListeners == null || !enabledListeners.contains(myComponent)) {
+                      startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
                   }
-                  finish()
-              }
-
-              private fun startService() {
-                  startForegroundService(Intent(this, BatteryService::class.java))
               }
           }
           EOF
 
-          cat << 'EOF' > app/src/main/java/com/walkman/batteryline/BatteryService.kt
-          package com.walkman.batteryline
+          cat << 'EOF' > app/src/main/java/com/walkman/remote/WalkmanNotificationListener.kt
+          package com.walkman.remote
 
-          import android.app.Notification
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.app.Service
+          import android.content.ComponentName
+          import android.content.Context
+          import android.media.MediaMetadata
+          import android.media.session.MediaController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.os.Handler
+          import android.os.Looper
+          import android.service.notification.NotificationListenerService
+
+          class WalkmanNotificationListener : NotificationListenerService() {
+
+              companion object {
+                  var instance: WalkmanNotificationListener? = null
+                  var activeController: MediaController? = null
+                  var onStateChanged: ((PlaybackState?) -> Unit)? = null
+                  var onMetadataChanged: ((MediaMetadata?) -> Unit)? = null
+                  var onQueueChanged: (() -> Unit)? = null
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+
+              private val callback = object : MediaController.Callback() {
+                  override fun onPlaybackStateChanged(state: PlaybackState?) {
+                      handler.post { onStateChanged?.invoke(state) }
+                  }
+
+                  override fun onMetadataChanged(metadata: MediaMetadata?) {
+                      handler.post { onMetadataChanged?.invoke(metadata) }
+                  }
+
+                  override fun onQueueChanged(queue: MutableList<android.media.session.MediaSession.QueueItem>?) {
+                      handler.post { onQueueChanged?.invoke() }
+                  }
+              }
+
+              override fun onListenerConnected() {
+                  super.onListenerConnected()
+                  instance = this
+                  bindActiveSession()
+              }
+
+              override fun onListenerDisconnected() {
+                  super.onListenerDisconnected()
+                  activeController?.unregisterCallback(callback)
+                  activeController = null
+                  instance = null
+              }
+
+              fun bindActiveSession() {
+                  val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+                  val component = ComponentName(this, WalkmanNotificationListener::class.java)
+                  try {
+                      val sessions = manager.getActiveSessions(component)
+                      val sonySession = sessions.firstOrNull { it.packageName.contains("sony") || it.packageName.contains("music") }
+                          ?: sessions.firstOrNull()
+
+                      if (sonySession != null && sonySession.sessionToken != activeController?.sessionToken) {
+                          activeController?.unregisterCallback(callback)
+                          activeController = sonySession
+                          sonySession.registerCallback(callback, handler)
+                          handler.post {
+                              onMetadataChanged?.invoke(sonySession.metadata)
+                              onStateChanged?.invoke(sonySession.playbackState)
+                              onQueueChanged?.invoke()
+                          }
+                      }
+                  } catch (_: Exception) {}
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/walkman/remote/WalkmanRemoteView.kt
+          package com.walkman.remote
+
+          import android.annotation.SuppressLint
+          import android.app.AlertDialog
           import android.content.BroadcastReceiver
           import android.content.Context
           import android.content.Intent
           import android.content.IntentFilter
-          import android.graphics.Canvas
-          import android.graphics.Color
-          import android.graphics.Paint
-          import android.graphics.PixelFormat
+          import android.graphics.*
+          import android.media.AudioManager
+          import android.media.MediaMetadata
+          import android.media.session.PlaybackState
           import android.os.BatteryManager
-          import android.os.IBinder
-          import android.view.Gravity
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.StatFs
+          import android.view.MotionEvent
           import android.view.View
-          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.content.ContextCompat
+          import kotlin.math.atan2
+          import kotlin.math.hypot
 
-          class BatteryService : Service() {
-              private lateinit var windowManager: WindowManager
-              private lateinit var lineView: BatteryLineView
+          @SuppressLint("ViewConstructor")
+          class WalkmanRemoteView(context: Context) : View(context) {
 
-              private val batteryReceiver = object : BroadcastReceiver() {
-                  override fun onReceive(context: Context?, intent: Intent?) {
-                      intent?.let {
-                          val level = it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-                          val scale = it.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-                          if (level >= 0 && scale > 0) {
-                              val percent = (level * 100) / scale
-                              lineView.updateBattery(percent)
+              private val prefs = context.getSharedPreferences("walkman_remote", Context.MODE_PRIVATE)
+              private var accentColor: Int = prefs.getInt("accent_color", Color.parseColor("#F13F2B"))
+
+              private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  style = Paint.Style.STROKE
+                  strokeWidth = 1f
+              }
+
+              private val fillAccentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = accentColor
+                  style = Paint.Style.FILL
+              }
+
+              private val fillWhitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  style = Paint.Style.FILL
+              }
+
+              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  typeface = Typeface.MONOSPACE
+                  textSize = 28f // 20pt на 720p экране
+              }
+
+              private var batteryPercent: Int = 0
+              private var internalMemPercent: Int = 0
+              private var sdPercent: Int = 0
+              private var isSdPresent: Boolean = false
+
+              private var songTitle: String = "No track playing"
+              private var artistName: String = "Walkman A300"
+              private var trackDurationMs: Long = 0L
+              private var currentPositionMs: Long = 0L
+              private var isPlaying: Boolean = false
+              private var trackIndexText: String = "0/0"
+              private var albumArtBitmap: Bitmap? = null
+              private var circularCoverBitmap: Bitmap? = null
+
+              private var discAngle: Float = 0f
+              private var lastFrameTime: Long = System.currentTimeMillis()
+
+              private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+              private var volumePercent: Int = 0
+
+              private var pressedButton: Int = -1 // 0: prev, 1: play, 2: next
+              private var isScrubbingDisc = false
+              private var initialTouchAngle = 0f
+              private var initialTrackPosOnScrub = 0L
+
+              private val seekHandler = Handler(Looper.getMainLooper())
+              private var seekRunnable: Runnable? = null
+
+              private val frameRunnable = object : Runnable {
+                  override fun run() {
+                      val now = System.currentTimeMillis()
+                      if (isPlaying && !isScrubbingDisc) {
+                          val dt = now - lastFrameTime
+                          // 10 RPM = 360 deg in 6000 ms => 0.06 deg/ms
+                          discAngle = (discAngle + dt * 0.06f) % 360f
+                          currentPositionMs += dt
+                          if (currentPositionMs > trackDurationMs && trackDurationMs > 0) {
+                              currentPositionMs = trackDurationMs
+                          }
+                      }
+                      lastFrameTime = now
+                      invalidate()
+                      postDelayed(this, 16)
+                  }
+              }
+
+              init {
+                  updateStorageStats()
+                  updateVolume()
+
+                  val batteryReceiver = object : BroadcastReceiver() {
+                      override fun onReceive(c: Context?, intent: Intent?) {
+                          intent?.let {
+                              val level = it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                              val scale = it.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                              if (level >= 0 && scale > 0) {
+                                  batteryPercent = (level * 100) / scale
+                                  invalidate()
+                              }
                           }
                       }
                   }
-              }
+                  context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
 
-              override fun onCreate() {
-                  super.onCreate()
-                  startAsForeground()
+                  WalkmanNotificationListener.onMetadataChanged = { meta ->
+                      meta?.let {
+                          songTitle = it.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Unknown Title"
+                          artistName = it.getString(MediaMetadata.METADATA_KEY_ARTIST)
+                              ?: it.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: "Unknown Artist"
+                          trackDurationMs = it.getLong(MediaMetadata.METADATA_KEY_DURATION)
 
-                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-                  lineView = BatteryLineView(this)
+                          val rawArt = it.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                              ?: it.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                          setAlbumArt(rawArt)
 
-                  val params = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.MATCH_PARENT,
-                      2,
-                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                              WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                      PixelFormat.TRANSLUCENT
-                  ).apply {
-                      gravity = Gravity.TOP or Gravity.START
-                      x = 0
-                      y = 0
-                  }
-
-                  windowManager.addView(lineView, params)
-                  if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                      registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_EXPORTED)
-                  } else {
-                      registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                  }
-              }
-
-              override fun onDestroy() {
-                  super.onDestroy()
-                  unregisterReceiver(batteryReceiver)
-                  windowManager.removeView(lineView)
-              }
-
-              override fun onBind(intent: Intent?): IBinder? = null
-
-              private fun startAsForeground() {
-                  val channelId = "battery_line_channel"
-                  val channel = NotificationChannel(
-                      channelId,
-                      "Battery Line",
-                      NotificationManager.IMPORTANCE_MIN
-                  )
-                  val manager = getSystemService(NotificationManager::class.java)
-                  manager.createNotificationChannel(channel)
-
-                  val notification = Notification.Builder(this, channelId)
-                      .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
-                      .setContentTitle("")
-                      .build()
-
-                  startForeground(1, notification)
-              }
-
-              private class BatteryLineView(context: Context) : View(context) {
-                  private var batteryPercent: Int = 100
-                  private val paint = Paint()
-
-                  fun updateBattery(percent: Int) {
-                      batteryPercent = percent
-                      postInvalidate()
-                  }
-
-                  override fun onDraw(canvas: Canvas) {
-                      super.onDraw(canvas)
-                      val currentWidth = width * (batteryPercent / 100f)
-                      paint.color = when {
-                          batteryPercent > 20 -> Color.WHITE
-                          batteryPercent > 10 -> Color.YELLOW
-                          else -> Color.RED
+                          val curTrack = it.getLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER)
+                          val totalTracks = it.getLong(MediaMetadata.METADATA_KEY_NUM_TRACKS)
+                          if (curTrack > 0 && totalTracks > 0) {
+                              trackIndexText = "$curTrack/$totalTracks"
+                          }
+                          invalidate()
                       }
-                      canvas.drawRect(0f, 0f, currentWidth, height.toFloat(), paint)
                   }
+
+                  WalkmanNotificationListener.onStateChanged = { state ->
+                      state?.let {
+                          isPlaying = it.state == PlaybackState.STATE_PLAYING
+                          currentPositionMs = it.position
+                          invalidate()
+                      }
+                  }
+
+                  post(frameRunnable)
+              }
+
+              private fun updateStorageStats() {
+                  try {
+                      val internalStat = StatFs(Environment.getDataDirectory().path)
+                      val totalBytes = internalStat.totalBytes
+                      val freeBytes = internalStat.availableBytes
+                      internalMemPercent = (((totalBytes - freeBytes) * 100) / totalBytes).toInt()
+
+                      val externalDirs = ContextCompat.getExternalFilesDirs(context, null)
+                      val sdFile = externalDirs.firstOrNull { it != null && Environment.isExternalStorageRemovable(it) }
+                      if (sdFile != null) {
+                          val sdStat = StatFs(sdFile.path)
+                          val sdTotal = sdStat.totalBytes
+                          val sdFree = sdStat.availableBytes
+                          sdPercent = (((sdTotal - sdFree) * 100) / sdTotal).toInt()
+                          isSdPresent = true
+                      } else {
+                          isSdPresent = false
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              private fun updateVolume() {
+                  val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                  val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                  volumePercent = if (max > 0) (current * 100) / max else 0
+              }
+
+              private fun setAlbumArt(bmp: Bitmap?) {
+                  albumArtBitmap = bmp
+                  if (bmp != null) {
+                      val size = 214
+                      val scaled = Bitmap.createScaledBitmap(bmp, size, size, true)
+                      val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                      val canvas = Canvas(output)
+                      val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                      canvas.drawCircle(size / 2f, size / 2f, size / 2f, paint)
+                      paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+                      canvas.drawBitmap(scaled, 0f, 0f, paint)
+                      circularCoverBitmap = output
+                  } else {
+                      circularCoverBitmap = null
+                  }
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  canvas.drawColor(Color.BLACK)
+
+                  fillAccentPaint.color = accentColor
+
+                  drawTopRow(canvas)
+                  drawDiscArea(canvas)
+                  drawTitleRow(canvas)
+                  drawPlaybackButtons(canvas)
+                  drawVolumeBar(canvas)
+                  drawBottomRow(canvas)
+              }
+
+              private fun drawTopRow(canvas: Canvas) {
+                  val h = 52f
+                  canvas.drawLine(0f, h, 720f, h, linePaint)
+                  canvas.drawLine(240f, 0f, 240f, h, linePaint)
+                  canvas.drawLine(480f, 0f, 480f, h, linePaint)
+
+                  // B (Battery)
+                  val bWidth = 240f * (batteryPercent / 100f)
+                  if (bWidth > 0f) canvas.drawRect(0f, 0f, bWidth, h, fillAccentPaint)
+                  canvas.drawText("B", 20f, 36f, textPaint)
+                  val bText = "$batteryPercent%"
+                  canvas.drawText(bText, 240f - 20f - textPaint.measureText(bText), 36f, textPaint)
+
+                  // M (Internal Memory)
+                  val mWidth = 240f * (internalMemPercent / 100f)
+                  if (mWidth > 0f) canvas.drawRect(240f, 0f, 240f + mWidth, h, fillAccentPaint)
+                  canvas.drawText("M", 260f, 36f, textPaint)
+                  val mText = "$internalMemPercent%"
+                  canvas.drawText(mText, 480f - 20f - textPaint.measureText(mText), 36f, textPaint)
+
+                  // SD (Card)
+                  if (isSdPresent) {
+                      val sdWidth = 240f * (sdPercent / 100f)
+                      if (sdWidth > 0f) canvas.drawRect(480f, 0f, 480f + sdWidth, h, fillAccentPaint)
+                      canvas.drawText("SD", 500f, 36f, textPaint)
+                      val sdText = "$sdPercent%"
+                      canvas.drawText(sdText, 720f - 20f - textPaint.measureText(sdText), 36f, textPaint)
+                  } else {
+                      // Crossed out box
+                      canvas.drawLine(480f, 0f, 720f, h, linePaint)
+                      canvas.drawLine(480f, h, 720f, 0f, linePaint)
+                      canvas.drawText("SD", 580f, 36f, textPaint)
+                  }
+              }
+
+              private fun drawDiscArea(canvas: Canvas) {
+                  val top = 52f
+                  val bottom = 772f
+                  val cx = 360f
+                  val cy = 412f
+                  canvas.drawLine(0f, bottom, 720f, bottom, linePaint)
+
+                  // Time texts
+                  val elapsedSec = currentPositionMs / 1000
+                  val remainSec = ((trackDurationMs - currentPositionMs).coerceAtLeast(0L)) / 1000
+                  val elapsedStr = String.format("+ %02d:%02d", elapsedSec / 60, elapsedSec % 60)
+                  val remainStr = String.format("- %02d:%02d", remainSec / 60, remainSec % 60)
+
+                  canvas.drawText(elapsedStr, 20f, top + 42f, textPaint)
+                  canvas.drawText(remainStr, 700f - textPaint.measureText(remainStr), top + 42f, textPaint)
+                  canvas.drawText(trackIndexText, 20f, bottom - 24f, textPaint)
+
+                  // Outer ring
+                  canvas.drawCircle(cx, cy, 359f, linePaint)
+
+                  // Rotating elements
+                  canvas.save()
+                  canvas.rotate(discAngle, cx, cy)
+
+                  // Inner concentric guide
+                  canvas.drawCircle(cx, cy, 214f / 2f, linePaint)
+
+                  if (circularCoverBitmap != null) {
+                      canvas.drawBitmap(circularCoverBitmap!!, cx - 107f, cy - 107f, null)
+                  } else {
+                      // Crosshair & red dot
+                      canvas.drawLine(cx - 107f, cy, cx + 107f, cy, linePaint)
+                      canvas.drawLine(cx, cy - 107f, cx, cy + 107f, linePaint)
+                      canvas.drawCircle(cx, cy, 19f / 2f, fillAccentPaint)
+                  }
+
+                  // 4 Rotating tangent arrows
+                  val rTick = 260f
+                  drawArrow(canvas, cx, cy - rTick, 0f)    // Top -> Right
+                  drawArrow(canvas, cx + rTick, cy, 90f)   // Right -> Down
+                  drawArrow(canvas, cx, cy + rTick, 180f)  // Bottom -> Left
+                  drawArrow(canvas, cx - rTick, cy, 270f)  // Left -> Up
+
+                  canvas.restore()
+              }
+
+              private fun drawArrow(canvas: Canvas, x: Float, y: Float, rot: Float) {
+                  canvas.save()
+                  canvas.rotate(rot, x, y)
+                  val path = Path().apply {
+                      moveTo(x - 8f, y)
+                      lineTo(x + 8f, y)
+                      moveTo(x + 2f, y - 5f)
+                      lineTo(x + 8f, y)
+                      lineTo(x + 2f, y + 5f)
+                  }
+                  canvas.drawPath(path, linePaint)
+                  canvas.restore()
+              }
+
+              private fun drawTitleRow(canvas: Canvas) {
+                  val top = 772f
+                  val bottom = 889f
+                  canvas.drawLine(0f, bottom, 720f, bottom, linePaint)
+
+                  var title = songTitle
+                  if (textPaint.measureText(title) > 550f) {
+                      title = title.take(22) + "..."
+                  }
+                  var artist = artistName
+                  if (textPaint.measureText(artist) > 550f) {
+                      artist = artist.take(22) + "..."
+                  }
+
+                  canvas.drawText(title, 20f, top + 45f, textPaint)
+                  canvas.drawText(artist, 20f, top + 92f, textPaint)
+
+                  // Color Picker button C
+                  val btnCx = 670f
+                  val btnCy = top + 58f
+                  val btnR = 30f
+                  canvas.drawCircle(btnCx, btnCy, btnR, fillAccentPaint)
+                  val cText = "C"
+                  val cW = textPaint.measureText(cText)
+                  canvas.drawText(cText, btnCx - cW / 2f, btnCy + 10f, fillWhitePaint)
+              }
+
+              private fun drawPlaybackButtons(canvas: Canvas) {
+                  val top = 889f
+                  val bottom = 1129f
+                  val h = 240f
+                  canvas.drawLine(0f, bottom, 720f, bottom, linePaint)
+                  canvas.drawLine(240f, top, 240f, bottom, linePaint)
+                  canvas.drawLine(480f, top, 480f, bottom, linePaint)
+
+                  // Button 0: Prev
+                  if (pressedButton == 0) canvas.drawRect(0f, top, 240f, bottom, fillAccentPaint)
+                  drawDoubleChevron(canvas, 120f, top + 120f, true)
+
+                  // Button 1: Play/Pause
+                  if (pressedButton == 1) canvas.drawRect(240f, top, 480f, bottom, fillAccentPaint)
+                  if (isPlaying) {
+                      // Pause icon: two vertical bars
+                      canvas.drawLine(345f, top + 80f, 345f, top + 160f, linePaint)
+                      canvas.drawLine(375f, top + 80f, 375f, top + 160f, linePaint)
+                  } else {
+                      // Play icon: right chevron
+                      val path = Path().apply {
+                          moveTo(345f, top + 80f)
+                          lineTo(385f, top + 120f)
+                          lineTo(345f, top + 160f)
+                      }
+                      canvas.drawPath(path, linePaint)
+                  }
+
+                  // Button 2: Next
+                  if (pressedButton == 2) canvas.drawRect(480f, top, 720f, bottom, fillAccentPaint)
+                  drawDoubleChevron(canvas, 600f, top + 120f, false)
+              }
+
+              private fun drawDoubleChevron(canvas: Canvas, cx: Float, cy: Float, isLeft: Boolean) {
+                  val d = if (isLeft) -1f else 1f
+                  val path = Path().apply {
+                      moveTo(cx - 15f * d, cy - 40f)
+                      lineTo(cx + 15f * d, cy)
+                      lineTo(cx - 15f * d, cy + 40f)
+
+                      moveTo(cx - 35f * d, cy - 40f)
+                      lineTo(cx - 5f * d, cy)
+                      lineTo(cx - 35f * d, cy + 40f)
+                  }
+                  canvas.drawPath(path, linePaint)
+              }
+
+              private fun drawVolumeBar(canvas: Canvas) {
+                  val top = 1129f
+                  val bottom = 1196f
+                  canvas.drawLine(0f, bottom, 720f, bottom, linePaint)
+
+                  val fillW = 720f * (volumePercent / 100f)
+                  if (fillW > 0f) {
+                      canvas.drawRect(0f, top, fillW, bottom, fillAccentPaint)
+                  }
+
+                  canvas.drawText("volume", 20f, top + 42f, textPaint)
+                  val vText = "$volumePercent%"
+                  canvas.drawText(vText, 700f - textPaint.measureText(vText), top + 42f, textPaint)
+              }
+
+              private fun drawBottomRow(canvas: Canvas) {
+                  val top = 1196f
+                  val bottom = 1280f
+                  canvas.drawLine(240f, top, 240f, bottom, linePaint)
+                  canvas.drawLine(480f, top, 480f, bottom, linePaint)
+
+                  // Repeat pill
+                  val pillLeft = 40f
+                  val pillTop = top + 24f
+                  val pillRight = 200f
+                  val pillBottom = top + 60f
+                  val rectF = RectF(pillLeft, pillTop, pillRight, pillBottom)
+                  canvas.drawRoundRect(rectF, 18f, 18f, linePaint)
+                  val repText = when (WalkmanNotificationListener.activeController?.playbackState?.let {
+                      WalkmanNotificationListener.activeController?.repeatMode
+                  }) {
+                      PlaybackState.REPEAT_MODE_ONE -> "1"
+                      PlaybackState.REPEAT_MODE_ALL, PlaybackState.REPEAT_MODE_GROUP -> "all"
+                      else -> "-"
+                  }
+                  canvas.drawText(repText, 120f - textPaint.measureText(repText) / 2f, top + 49f, textPaint)
+
+                  // Shuffle circles
+                  val sh1Cx = 340f
+                  val sh2Cx = 380f
+                  val shCy = top + 42f
+                  val shR = 20f
+                  canvas.drawCircle(sh1Cx, shCy, shR, linePaint)
+                  canvas.drawCircle(sh2Cx, shCy, shR, linePaint)
+                  val isShuffle = WalkmanNotificationListener.activeController?.shuffleMode == PlaybackState.SHUFFLE_MODE_ALL
+                  if (isShuffle) {
+                      canvas.drawCircle(sh1Cx, shCy, 4f, fillAccentPaint)
+                      canvas.drawCircle(sh2Cx, shCy, 4f, fillAccentPaint)
+                  }
+
+                  // Library L stacked discs
+                  val libCx = 600f
+                  val libCy = top + 42f
+                  val ow = 60f
+                  val oh = 12f
+                  canvas.drawOval(RectF(libCx - ow, libCy + 10f - oh, libCx + ow, libCy + 10f + oh), linePaint)
+                  canvas.drawOval(RectF(libCx - ow, libCy - oh, libCx + ow, libCy + oh), linePaint)
+                  canvas.drawOval(RectF(libCx - ow, libCy - 10f - oh, libCx + ow, libCy - 10f + oh), linePaint)
+                  canvas.drawText("L", libCx - textPaint.measureText("L") / 2f, libCy - 14f, textPaint)
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              override fun onTouchEvent(event: MotionEvent): Boolean {
+                  val x = event.x
+                  val y = event.y
+
+                  when (event.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          // Disc touch check (within radius 359)
+                          val distFromCenter = hypot((x - 360f), (y - 412f))
+                          if (distFromCenter <= 359f && y in 52f..772f) {
+                              isScrubbingDisc = true
+                              initialTouchAngle = (Math.toDegrees(atan2((y - 412.0), (x - 360.0))).toFloat() + 360f) % 360f
+                              initialTrackPosOnScrub = currentPositionMs
+                              return true
+                          }
+
+                          // Color button C
+                          if (hypot((x - 670f), (y - 830f)) <= 35f) {
+                              showColorPickerDialog()
+                              return true
+                          }
+
+                          // Playback row
+                          if (y in 889f..1129f) {
+                              pressedButton = when {
+                                  x < 240f -> 0
+                                  x < 480f -> 1
+                                  else -> 2
+                              }
+                              startLongPressSeek(pressedButton)
+                              invalidate()
+                              return true
+                          }
+
+                          // Volume bar
+                          if (y in 1129f..1196f) {
+                              updateVolumeFromTouch(x)
+                              return true
+                          }
+
+                          // Bottom row
+                          if (y in 1196f..1280f) {
+                              when {
+                                  x < 240f -> toggleRepeat()
+                                  x < 480f -> toggleShuffle()
+                                  else -> openSonyLibrary()
+                              }
+                              return true
+                          }
+                      }
+
+                      MotionEvent.ACTION_MOVE -> {
+                          if (isScrubbingDisc) {
+                              val curAngle = (Math.toDegrees(atan2((y - 412.0), (x - 360.0))).toFloat() + 360f) % 360f
+                              var deltaAngle = curAngle - initialTouchAngle
+                              if (deltaAngle > 180f) deltaAngle -= 360f
+                              if (deltaAngle < -180f) deltaAngle += 360f
+
+                              // 1 full turn (360 deg) = 30 seconds
+                              val deltaMs = (deltaAngle / 360f * 30000L).toLong()
+                              currentPositionMs = (initialTrackPosOnScrub + deltaMs).coerceIn(0L, trackDurationMs)
+                              discAngle = (discAngle + deltaAngle) % 360f
+                              initialTouchAngle = curAngle
+                              initialTrackPosOnScrub = currentPositionMs
+                              invalidate()
+                              return true
+                          }
+
+                          if (y in 1129f..1196f) {
+                              updateVolumeFromTouch(x)
+                              return true
+                          }
+                      }
+
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          if (isScrubbingDisc) {
+                              isScrubbingDisc = false
+                              WalkmanNotificationListener.activeController?.transportControls?.seekTo(currentPositionMs)
+                          }
+
+                          cancelLongPressSeek()
+
+                          if (pressedButton != -1) {
+                              when (pressedButton) {
+                                  0 -> WalkmanNotificationListener.activeController?.transportControls?.skipToPrevious()
+                                  1 -> {
+                                      val ctrl = WalkmanNotificationListener.activeController
+                                      if (isPlaying) ctrl?.transportControls?.pause() else ctrl?.transportControls?.play()
+                                  }
+                                  2 -> WalkmanNotificationListener.activeController?.transportControls?.skipToNext()
+                              }
+                              pressedButton = -1
+                              invalidate()
+                          }
+                      }
+                  }
+                  return true
+              }
+
+              private fun startLongPressSeek(btn: Int) {
+                  if (btn != 0 && btn != 2) return
+                  seekRunnable = object : Runnable {
+                      override fun run() {
+                          val step = if (btn == 0) -5000L else 5000L
+                          currentPositionMs = (currentPositionMs + step).coerceIn(0L, trackDurationMs)
+                          WalkmanNotificationListener.activeController?.transportControls?.seekTo(currentPositionMs)
+                          invalidate()
+                          seekHandler.postDelayed(this, 300)
+                      }
+                  }
+                  seekHandler.postDelayed(seekRunnable!!, 500)
+              }
+
+              private fun cancelLongPressSeek() {
+                  seekRunnable?.let { seekHandler.removeCallbacks(it) }
+                  seekRunnable = null
+              }
+
+              private fun updateVolumeFromTouch(x: Float) {
+                  volumePercent = ((x.coerceIn(0f, 720f) / 720f) * 100).toInt()
+                  val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                  val target = (volumePercent * max) / 100
+                  audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+                  invalidate()
+              }
+
+              private fun toggleRepeat() {
+                  val ctrl = WalkmanNotificationListener.activeController ?: return
+                  val nextMode = when (ctrl.repeatMode) {
+                      PlaybackState.REPEAT_MODE_NONE -> PlaybackState.REPEAT_MODE_ONE
+                      PlaybackState.REPEAT_MODE_ONE -> PlaybackState.REPEAT_MODE_ALL
+                      else -> PlaybackState.REPEAT_MODE_NONE
+                  }
+                  ctrl.transportControls.setRepeatMode(nextMode)
+                  invalidate()
+              }
+
+              private fun toggleShuffle() {
+                  val ctrl = WalkmanNotificationListener.activeController ?: return
+                  val next = if (ctrl.shuffleMode == PlaybackState.SHUFFLE_MODE_ALL) {
+                      PlaybackState.SHUFFLE_MODE_NONE
+                  } else {
+                      PlaybackState.SHUFFLE_MODE_ALL
+                  }
+                  ctrl.transportControls.setShuffleMode(next)
+                  invalidate()
+              }
+
+              private fun openSonyLibrary() {
+                  try {
+                      val intent = context.packageManager.getLaunchIntentForPackage("com.sony.walkman.mediasession")
+                          ?: Intent(Intent.ACTION_MAIN).apply { addCategory(Intent.CATEGORY_APP_MUSIC) }
+                      context.startActivity(intent)
+                  } catch (_: Exception) {
+                      Toast.makeText(context, "Открепите экран для перехода в библиотеку", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun showColorPickerDialog() {
+                  val layout = LinearLayout(context).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(50, 40, 50, 20)
+                      setBackgroundColor(Color.parseColor("#1A1A1A"))
+                  }
+
+                  var r = Color.red(accentColor)
+                  var g = Color.green(accentColor)
+                  var b = Color.blue(accentColor)
+
+                  val preview = View(context).apply {
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 80)
+                      setBackgroundColor(accentColor)
+                  }
+                  layout.addView(preview)
+
+                  fun addChannelSlider(label: String, initial: Int, onProgress: (Int) -> Unit) {
+                      val text = TextView(context).apply {
+                          this.text = "$label: $initial"
+                          setTextColor(Color.WHITE)
+                          typeface = Typeface.MONOSPACE
+                          setPadding(0, 20, 0, 5)
+                      }
+                      layout.addView(text)
+
+                      val seek = SeekBar(context).apply {
+                          max = 255
+                          progress = initial
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                                  onProgress(p)
+                                  text.text = "$label: $p"
+                                  preview.setBackgroundColor(Color.rgb(r, g, b))
+                              }
+                              override fun onStartTrackingTouch(s: SeekBar?) {}
+                              override fun onStopTrackingTouch(s: SeekBar?) {}
+                          })
+                      }
+                      layout.addView(seek)
+                  }
+
+                  addChannelSlider("R", r) { r = it }
+                  addChannelSlider("G", g) { g = it }
+                  addChannelSlider("B", b) { b = it }
+
+                  AlertDialog.Builder(context)
+                      .setTitle("Accent Color")
+                      .setView(layout)
+                      .setPositiveButton("OK") { _, _ ->
+                          accentColor = Color.rgb(r, g, b)
+                          prefs.edit().putInt("accent_color", accentColor).apply()
+                          invalidate()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
               }
           }
           EOF
@@ -272,5 +938,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: battery-line-apk
+          name: walkman-remote-apk
           path: app/build/outputs/apk/debug/app-debug.apk

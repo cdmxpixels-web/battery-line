@@ -334,10 +334,10 @@ jobs:
               private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
               private var volumePercent: Int = 0
 
-              private var repeatState: Int = 0 // 0: off (-), 1: one, 2: all
-              private var shuffleState: Int = 0 // 0: off, 1: all
+              private var repeatState: Int = 0
+              private var shuffleState: Int = 0
 
-              private var pressedButton: Int = -1 // 0: prev, 1: play, 2: next
+              private var pressedButton: Int = -1
               private var isScrubbingDisc = false
               private var initialTouchAngle = 0f
               private var initialTrackPosOnScrub = 0L
@@ -478,21 +478,18 @@ jobs:
                   canvas.drawLine(240f, 0f, 240f, h, linePaint)
                   canvas.drawLine(480f, 0f, 480f, h, linePaint)
 
-                  // B (Battery)
                   val bWidth = 240f * (batteryPercent / 100f)
                   if (bWidth > 0f) canvas.drawRect(0f, 0f, bWidth, h, fillAccentPaint)
                   canvas.drawText("B", 20f, 36f, textPaint)
                   val bText = "$batteryPercent%"
                   canvas.drawText(bText, 240f - 20f - textPaint.measureText(bText), 36f, textPaint)
 
-                  // M (Internal Memory)
                   val mWidth = 240f * (internalMemPercent / 100f)
                   if (mWidth > 0f) canvas.drawRect(240f, 0f, 240f + mWidth, h, fillAccentPaint)
                   canvas.drawText("M", 260f, 36f, textPaint)
                   val mText = "$internalMemPercent%"
                   canvas.drawText(mText, 480f - 20f - textPaint.measureText(mText), 36f, textPaint)
 
-                  // SD (Card)
                   if (isSdPresent) {
                       val sdWidth = 240f * (sdPercent / 100f)
                       if (sdWidth > 0f) canvas.drawRect(480f, 0f, 480f + sdWidth, h, fillAccentPaint)
@@ -647,7 +644,6 @@ jobs:
                   canvas.drawLine(240f, top, 240f, bottom, linePaint)
                   canvas.drawLine(480f, top, 480f, bottom, linePaint)
 
-                  // Repeat pill
                   val rectF = RectF(40f, top + 24f, 200f, top + 60f)
                   canvas.drawRoundRect(rectF, 18f, 18f, linePaint)
                   val repText = when (repeatState) {
@@ -657,7 +653,6 @@ jobs:
                   }
                   canvas.drawText(repText, 120f - textPaint.measureText(repText) / 2f, top + 49f, textPaint)
 
-                  // Shuffle circles
                   val sh1Cx = 340f
                   val sh2Cx = 380f
                   val shCy = top + 42f
@@ -669,7 +664,6 @@ jobs:
                       canvas.drawCircle(sh2Cx, shCy, 4f, fillAccentPaint)
                   }
 
-                  // Library L stacked discs
                   val libCx = 600f
                   val libCy = top + 42f
                   val ow = 60f
@@ -755,3 +749,138 @@ jobs:
                           }
 
                           cancelLongPressSeek()
+
+                          if (pressedButton != -1) {
+                              when (pressedButton) {
+                                  0 -> WalkmanNotificationListener.activeController?.transportControls?.skipToPrevious()
+                                  1 -> {
+                                      val ctrl = WalkmanNotificationListener.activeController
+                                      if (isPlaying) ctrl?.transportControls?.pause() else ctrl?.transportControls?.play()
+                                  }
+                                  2 -> WalkmanNotificationListener.activeController?.transportControls?.skipToNext()
+                              }
+                              pressedButton = -1
+                              invalidate()
+                          }
+                      }
+                  }
+                  return true
+              }
+
+              private fun startLongPressSeek(btn: Int) {
+                  if (btn != 0 && btn != 2) return
+                  seekRunnable = object : Runnable {
+                      override fun run() {
+                          val step = if (btn == 0) -5000L else 5000L
+                          currentPositionMs = (currentPositionMs + step).coerceIn(0L, trackDurationMs)
+                          WalkmanNotificationListener.activeController?.transportControls?.seekTo(currentPositionMs)
+                          invalidate()
+                          seekHandler.postDelayed(this, 300)
+                      }
+                  }
+                  seekHandler.postDelayed(seekRunnable!!, 500)
+              }
+
+              private fun cancelLongPressSeek() {
+                  seekRunnable?.let { seekHandler.removeCallbacks(it) }
+                  seekRunnable = null
+              }
+
+              private fun updateVolumeFromTouch(x: Float) {
+                  volumePercent = ((x.coerceIn(0f, 720f) / 720f) * 100).toInt()
+                  val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                  val target = (volumePercent * max) / 100
+                  audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+                  invalidate()
+              }
+
+              private fun toggleRepeat() {
+                  val ctrl = WalkmanNotificationListener.activeController ?: return
+                  repeatState = (repeatState + 1) % 3
+                  ctrl.transportControls.setRepeatMode(repeatState)
+                  invalidate()
+              }
+
+              private fun toggleShuffle() {
+                  val ctrl = WalkmanNotificationListener.activeController ?: return
+                  shuffleState = if (shuffleState == 0) 1 else 0
+                  ctrl.transportControls.setShuffleMode(shuffleState)
+                  invalidate()
+              }
+
+              private fun openSonyLibrary() {
+                  try {
+                      val intent = context.packageManager.getLaunchIntentForPackage("com.sony.walkman.mediasession")
+                          ?: Intent(Intent.ACTION_MAIN).apply { addCategory(Intent.CATEGORY_APP_MUSIC) }
+                      context.startActivity(intent)
+                  } catch (_: Exception) {
+                      Toast.makeText(context, "Открепите экран для перехода в библиотеку", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun showColorPickerDialog() {
+                  val layout = LinearLayout(context).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(50, 40, 50, 20)
+                      setBackgroundColor(Color.parseColor("#1A1A1A"))
+                  }
+
+                  val rgb = intArrayOf(Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
+
+                  val preview = View(context).apply {
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 80)
+                      setBackgroundColor(accentColor)
+                  }
+                  layout.addView(preview)
+
+                  fun addChannelSlider(label: String, index: Int) {
+                      val text = TextView(context).apply {
+                          this.text = "$label: ${rgb[index]}"
+                          setTextColor(Color.WHITE)
+                          typeface = Typeface.MONOSPACE
+                          setPadding(0, 20, 0, 5)
+                      }
+                      layout.addView(text)
+
+                      val seek = SeekBar(context).apply {
+                          max = 255
+                          progress = rgb[index]
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                                  rgb[index] = p
+                                  text.text = "$label: $p"
+                                  preview.setBackgroundColor(Color.rgb(rgb[0], rgb[1], rgb[2]))
+                              }
+                              override fun onStartTrackingTouch(s: SeekBar?) {}
+                              override fun onStopTrackingTouch(s: SeekBar?) {}
+                          })
+                      }
+                      layout.addView(seek)
+                  }
+
+                  addChannelSlider("R", 0)
+                  addChannelSlider("G", 1)
+                  addChannelSlider("B", 2)
+
+                  AlertDialog.Builder(context)
+                      .setTitle("Accent Color")
+                      .setView(layout)
+                      .setPositiveButton("OK") { _, _ ->
+                          accentColor = Color.rgb(rgb[0], rgb[1], rgb[2])
+                          prefs.edit().putInt("accent_color", accentColor).apply()
+                          invalidate()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+          }
+          EOF
+
+      - name: Build APK with Gradle
+        run: gradle assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkman-remote-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

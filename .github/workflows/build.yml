@@ -150,7 +150,6 @@ jobs:
                   super.onCreate(savedInstanceState)
 
                   window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                  hideSystemUI()
 
                   val remoteView = WalkmanRemoteView(this)
                   setContentView(remoteView)
@@ -160,32 +159,42 @@ jobs:
 
               override fun onResume() {
                   super.onResume()
-                  hideSystemUI()
                   WalkmanNotificationListener.instance?.bindActiveSession()
               }
 
-              private fun hideSystemUI() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                      window.insetsController?.let {
-                          it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-                          it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                      }
-                  } else {
-                      @Suppress("DEPRECATION")
-                      window.decorView.systemUiVisibility = (
-                          View.SYSTEM_UI_FLAG_FULLSCREEN
-                          or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                          or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                      )
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus) {
+                      hideSystemUI()
                   }
               }
 
+              private fun hideSystemUI() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          window.insetsController?.let {
+                              it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                              it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                          }
+                      } else {
+                          @Suppress("DEPRECATION")
+                          window.decorView.systemUiVisibility = (
+                              View.SYSTEM_UI_FLAG_FULLSCREEN
+                              or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                              or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                          )
+                      }
+                  } catch (e: Exception) {}
+              }
+
               private fun checkNotificationPermission() {
-                  val enabledListeners = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
-                  val myComponent = ComponentName(this, WalkmanNotificationListener::class.java).flattenToString()
-                  if (enabledListeners == null || !enabledListeners.contains(myComponent)) {
-                      startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
-                  }
+                  try {
+                      val enabledListeners = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+                      val myComponent = ComponentName(this, WalkmanNotificationListener::class.java).flattenToString()
+                      if (enabledListeners == null || !enabledListeners.contains(myComponent)) {
+                          startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+                      }
+                  } catch (e: Exception) {}
               }
           }
           EOF
@@ -379,7 +388,16 @@ jobs:
                           }
                       }
                   }
-                  context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  
+                  try {
+                      if (android.os.Build.VERSION.SDK_INT >= 33) {
+                          context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_EXPORTED)
+                      } else {
+                          context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                      }
+                  } catch (e: Exception) {
+                      context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  }
 
                   WalkmanNotificationListener.onMetadataChanged = { meta ->
                       meta?.let {

@@ -274,6 +274,7 @@ jobs:
           import android.media.MediaMetadata
           import android.media.session.PlaybackState
           import android.os.BatteryManager
+          import android.os.Bundle
           import android.os.Environment
           import android.os.Handler
           import android.os.Looper
@@ -797,14 +798,26 @@ jobs:
               private fun toggleRepeat() {
                   val ctrl = WalkmanNotificationListener.activeController ?: return
                   repeatState = (repeatState + 1) % 3
-                  ctrl.transportControls.setRepeatMode(repeatState)
+                  try {
+                      val method = ctrl.transportControls.javaClass.getMethod("setRepeatMode", Int::class.javaPrimitiveType)
+                      method.invoke(ctrl.transportControls, repeatState)
+                  } catch (e: Exception) {
+                      val b = Bundle().apply { putInt("repeatMode", repeatState) }
+                      ctrl.transportControls.sendCustomAction("setRepeatMode", b)
+                  }
                   invalidate()
               }
 
               private fun toggleShuffle() {
                   val ctrl = WalkmanNotificationListener.activeController ?: return
                   shuffleState = if (shuffleState == 0) 1 else 0
-                  ctrl.transportControls.setShuffleMode(shuffleState)
+                  try {
+                      val method = ctrl.transportControls.javaClass.getMethod("setShuffleMode", Int::class.javaPrimitiveType)
+                      method.invoke(ctrl.transportControls, shuffleState)
+                  } catch (e: Exception) {
+                      val b = Bundle().apply { putInt("shuffleMode", shuffleState) }
+                      ctrl.transportControls.sendCustomAction("setShuffleMode", b)
+                  }
                   invalidate()
               }
 

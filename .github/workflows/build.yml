@@ -255,7 +255,7 @@ jobs:
                               onStateChanged?.invoke(sonySession.playbackState)
                           }
                       }
-                  } catch (_: Exception) {}
+                  } catch (e: Exception) {}
               }
           }
           EOF
@@ -434,7 +434,7 @@ jobs:
                               }
                           }
                       }
-                  } catch (_: Exception) {}
+                  } catch (e: Exception) {}
               }
 
               private fun updateVolume() {
@@ -813,7 +813,7 @@ jobs:
                       val intent = context.packageManager.getLaunchIntentForPackage("com.sony.walkman.mediasession")
                           ?: Intent(Intent.ACTION_MAIN).apply { addCategory(Intent.CATEGORY_APP_MUSIC) }
                       context.startActivity(intent)
-                  } catch (_: Exception) {
+                  } catch (e: Exception) {
                       Toast.makeText(context, "Открепите экран для перехода в библиотеку", Toast.LENGTH_SHORT).show()
                   }
               }

@@ -136,12 +136,9 @@ jobs:
           import android.app.Activity
           import android.content.ComponentName
           import android.content.Intent
-          import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.view.View
-          import android.view.WindowInsets
-          import android.view.WindowInsetsController
           import android.view.WindowManager
 
           class MainActivity : Activity() {
@@ -171,19 +168,12 @@ jobs:
 
               private fun hideSystemUI() {
                   try {
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                          window.insetsController?.let {
-                              it.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-                              it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                          }
-                      } else {
-                          @Suppress("DEPRECATION")
-                          window.decorView.systemUiVisibility = (
-                              View.SYSTEM_UI_FLAG_FULLSCREEN
-                              or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                              or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                          )
-                      }
+                      @Suppress("DEPRECATION")
+                      window.decorView.systemUiVisibility = (
+                          View.SYSTEM_UI_FLAG_FULLSCREEN
+                          or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                          or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      )
                   } catch (e: Exception) {}
               }
 
@@ -247,9 +237,9 @@ jobs:
               }
 
               fun bindActiveSession() {
-                  val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
-                  val component = ComponentName(this, WalkmanNotificationListener::class.java)
                   try {
+                      val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+                      val component = ComponentName(this, WalkmanNotificationListener::class.java)
                       val sessions = manager.getActiveSessions(component)
                       val sonySession = sessions.firstOrNull { 
                           it.packageName.contains("sony", ignoreCase = true) || it.packageName.contains("music", ignoreCase = true) 
@@ -376,6 +366,17 @@ jobs:
                   updateStorageStats()
                   updateVolume()
 
+                  try {
+                      val bIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                      bIntent?.let {
+                          val level = it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                          val scale = it.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                          if (level >= 0 && scale > 0) {
+                              batteryPercent = (level * 100) / scale
+                          }
+                      }
+                  } catch (e: Exception) {}
+
                   val batteryReceiver = object : BroadcastReceiver() {
                       override fun onReceive(c: Context?, intent: Intent?) {
                           intent?.let {
@@ -388,16 +389,10 @@ jobs:
                           }
                       }
                   }
-                  
+
                   try {
-                      if (android.os.Build.VERSION.SDK_INT >= 33) {
-                          context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_EXPORTED)
-                      } else {
-                          context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                      }
-                  } catch (e: Exception) {
                       context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                  }
+                  } catch (e: Exception) {}
 
                   WalkmanNotificationListener.onMetadataChanged = { meta ->
                       meta?.let {
@@ -817,12 +812,17 @@ jobs:
                   val ctrl = WalkmanNotificationListener.activeController ?: return
                   repeatState = (repeatState + 1) % 3
                   try {
-                      val method = ctrl.transportControls.javaClass.getMethod("setRepeatMode", Int::class.javaPrimitiveType)
-                      method.invoke(ctrl.transportControls, repeatState)
-                  } catch (e: Exception) {
+                      for (m in ctrl.transportControls.javaClass.methods) {
+                          if (m.name == "setRepeatMode" && m.parameterTypes.size == 1) {
+                              m.invoke(ctrl.transportControls, repeatState)
+                              break
+                          }
+                      }
+                  } catch (e: Exception) {}
+                  try {
                       val b = Bundle().apply { putInt("repeatMode", repeatState) }
                       ctrl.transportControls.sendCustomAction("setRepeatMode", b)
-                  }
+                  } catch (e: Exception) {}
                   invalidate()
               }
 
@@ -830,12 +830,17 @@ jobs:
                   val ctrl = WalkmanNotificationListener.activeController ?: return
                   shuffleState = if (shuffleState == 0) 1 else 0
                   try {
-                      val method = ctrl.transportControls.javaClass.getMethod("setShuffleMode", Int::class.javaPrimitiveType)
-                      method.invoke(ctrl.transportControls, shuffleState)
-                  } catch (e: Exception) {
+                      for (m in ctrl.transportControls.javaClass.methods) {
+                          if (m.name == "setShuffleMode" && m.parameterTypes.size == 1) {
+                              m.invoke(ctrl.transportControls, shuffleState)
+                              break
+                          }
+                      }
+                  } catch (e: Exception) {}
+                  try {
                       val b = Bundle().apply { putInt("shuffleMode", shuffleState) }
                       ctrl.transportControls.sendCustomAction("setShuffleMode", b)
-                  }
+                  } catch (e: Exception) {}
                   invalidate()
               }
 

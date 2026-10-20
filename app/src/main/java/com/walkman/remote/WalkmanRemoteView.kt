@@ -22,11 +22,14 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.PlaybackState
 import android.net.Uri
+import android.os.Build
+import android.os.Bundle
 import android.os.BatteryManager
 import android.os.Environment
 import android.os.Handler
@@ -206,6 +209,23 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var activeQueueId = -1L
     private var loadGeneration = 0
     private var formatKey: String? = null
+
+    // Если плеер не отдаёт очередь, список строится из альбома в библиотеке
+    private var currentAlbum = ""
+    private var currentTrackNo = 0
+    private var albumTracks: List<TrackItem> = emptyList()
+    private var albumKey: String? = null
+    private var albumLoading = false
+    private var trackSource = "только играющий трек"
+
+    // Способ управления громкостью. Меняется в окне "Громкость":
+    // подержите палец на полукруге около секунды, не двигая.
+    private var volMethod = prefs.getInt("vol_method", 0)
+    private val volMethodNames = arrayOf(
+        "0: системный индекс",
+        "1: шаги как у кнопок и панель Sony",
+        "2: шаги через сессию плеера"
+    )
 
     private var coverSquare: Bitmap? = null
     private var hdrArtistShown = ""
@@ -409,7 +429,9 @@ class WalkmanRemoteView(context: Context) : View(context) {
         titleShown = fit(songTitle, flexPaint, Design.TEXT_MAX_W)
         artistShown = fit(artistName, flexPaint, Design.TEXT_MAX_W)
 
-        if (tracks.size <= 1) rebuildTracks()
+        currentAlbum = meta.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
+        currentTrackNo = meta.getLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER).toInt()
+        rebuildTracks()
         refreshHeader(meta)
 
         refreshTrackText(meta)
@@ -821,7 +843,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 if (!volMoved && !cancelled &&
                     SystemClock.uptimeMillis() - volDownTime >= Design.CLONG_PRESS_MS
                 ) {
-                    Toast.makeText(context, volumeDiagnostics(), Toast.LENGTH_LONG).show()
+                    showVolumeDialog()
                 }
                 finishVolumeDrag()
             }
@@ -834,7 +856,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 if (!cancelled && hypot(x - Design.C_CX, y - Design.C_CY) <= Design.C_R + 12f) {
                     if (SystemClock.uptimeMillis() - colorDownTime >= Design.CLONG_PRESS_MS) {
                         // Долгое нажатие: показать данные об обложке (для настройки)
-                        Toast.makeText(context, lastCoverInfo + "\n" + queueInfo(), Toast.LENGTH_LONG).show()
+                        showInfo("Диагностика", lastCoverInfo + "\n\n" + queueInfo())
                     } else {
                         showColorPickerDialog()
                     }
@@ -891,6 +913,10 @@ class WalkmanRemoteView(context: Context) : View(context) {
         val target = (percent * max / 100f).roundToInt()
         if (target == lastSentVolume) return
         lastSentVolume = target
+        if (volMethod != 0) {
+            stepSystemVolume(target, volMethod == 2)
+            return
+        }
         try {
             val flags = if (Design.VOLUME_SHOW_PANEL) AudioManager.FLAG_SHOW_UI else 0
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, flags)
@@ -911,9 +937,49 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
     }
 
+    // Громкость шагами, как это делают физические кнопки
+    private fun stepSystemVolume(target: Int, viaSession: Boolean) {
+        try {
+            val ctrl = WalkmanNotificationListener.activeController
+            var cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            var guard = 0
+            while (cur != target && guard++ < 40) {
+                val dir = if (cur < target) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
+                if (viaSession && ctrl != null) {
+                    ctrl.adjustVolume(dir, 0)
+                } else {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, AudioManager.FLAG_SHOW_UI)
+                }
+                val next = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                if (next == cur) break
+                cur = next
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    // Окно "Громкость": сведения и переключение способа управления
+    private fun showVolumeDialog() {
+        try {
+            AlertDialog.Builder(context)
+                .setTitle("Громкость")
+                .setMessage(volumeDiagnostics())
+                .setPositiveButton("Следующий способ") { _, _ ->
+                    volMethod = (volMethod + 1) % volMethodNames.size
+                    prefs.edit().putInt("vol_method", volMethod).apply()
+                    Toast.makeText(context, "Способ " + volMethodNames[volMethod], Toast.LENGTH_LONG).show()
+                }
+                .setNegativeButton("Закрыть", null)
+                .show()
+        } catch (e: Exception) {
+            Toast.makeText(context, volumeDiagnostics(), Toast.LENGTH_LONG).show()
+        }
+    }
+
     // Сведения о громкости для настройки (долгое удержание пальца на полукруге)
     private fun volumeDiagnostics(): String {
         val sb = StringBuilder()
+        sb.append("Способ ").append(volMethodNames[volMethod]).append("\n")
         try {
             val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -926,7 +992,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
         try {
             val devs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                .joinToString(",") { it.type.toString() }
+                .joinToString(", ") { deviceName(it.type) }
             sb.append("\nВыходы (типы): ").append(devs)
         } catch (e: Exception) {
         }
@@ -941,19 +1007,64 @@ class WalkmanRemoteView(context: Context) : View(context) {
             }
         } catch (e: Exception) {
         }
+        // Как система переводит индексы громкости в децибелы для этих наушников
+        try {
+            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val outs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val dev = outs.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES || it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET
+            } ?: outs.firstOrNull()
+            if (dev != null) {
+                val pts = intArrayOf(0, max / 2, max)
+                val s = pts.joinToString("  ") { i ->
+                    String.format(Locale.US, "%d:%.0f", i, audioManager.getStreamVolumeDb(AudioManager.STREAM_MUSIC, i, dev.type))
+                }
+                sb.append("\nдБ (индекс:дБ): ").append(s)
+            }
+        } catch (e: Exception) {
+        }
         return sb.toString()
     }
 
+    private fun deviceName(t: Int): String = when (t) {
+        2 -> "speaker"
+        3 -> "wired_headset"
+        4 -> "wired_headphones"
+        7 -> "bt_sco"
+        8 -> "bt_a2dp"
+        11 -> "usb_device"
+        22 -> "usb_headset"
+        else -> "type$t"
+    }
+
+    private fun actionsInfo(a: Long): String {
+        val all = listOf(
+            PlaybackState.ACTION_PLAY to "play",
+            PlaybackState.ACTION_PAUSE to "pause",
+            PlaybackState.ACTION_SKIP_TO_NEXT to "next",
+            PlaybackState.ACTION_SKIP_TO_PREVIOUS to "prev",
+            PlaybackState.ACTION_SEEK_TO to "seek",
+            PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM to "queue_item",
+            PlaybackState.ACTION_PLAY_FROM_URI to "play_from_uri",
+            PlaybackState.ACTION_PLAY_FROM_MEDIA_ID to "play_from_id"
+        )
+        return all.filter { (a and it.first) != 0L }.joinToString(", ") { it.second }
+    }
+
     private fun queueInfo(): String {
-        return try {
+        val sb = StringBuilder()
+        try {
             val ctrl = WalkmanNotificationListener.activeController
-            val n = ctrl?.queue?.size ?: 0
-            val acts = ctrl?.playbackState?.actions ?: 0L
-            val canJump = (acts and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM) != 0L
-            "В очереди $n треков, переход по номеру: " + if (canJump) "есть" else "нет"
+            sb.append("Источник списка: ").append(trackSource)
+            sb.append("\nОчередь плеера: ").append(ctrl?.queue?.size ?: 0).append(" треков")
+            sb.append("\nДоступ к музыке: ").append(if (hasAudioPermission()) "есть" else "нет")
+            sb.append("\nАльбом: ").append(if (currentAlbum.isBlank()) "(не передан)" else currentAlbum)
+            sb.append("\nСессия: ").append(ctrl?.packageName ?: "нет")
+            sb.append("\nКоманды плеера: ").append(actionsInfo(ctrl?.playbackState?.actions ?: 0L))
         } catch (e: Exception) {
-            "Очередь недоступна"
+            sb.append("Данные недоступны")
         }
+        return sb.toString()
     }
 
     // В конце движения проверяем, что система приняла громкость.
@@ -1000,6 +1111,9 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // Пользователь ответил на запрос доступа к файлам: пробуем снова прочитать время и формат
     fun onPermissionResult() {
         formatKey = null
+        albumKey = null
+        albumTracks = emptyList()
+        rebuildTracks()
         loadDurationsAsync(tracks)
         loadFormatAsync(currentTrackUri())
     }
@@ -1016,8 +1130,20 @@ class WalkmanRemoteView(context: Context) : View(context) {
             null
         }
         var list = TrackLoader.fromQueue(q)
-        // Если плеер не отдаёт очередь, показываем хотя бы играющий трек
-        if (list.isEmpty()) list = listOf(TrackItem(-1L, songTitle, null, trackDurationMs))
+        if (list.size > 1) {
+            trackSource = "очередь плеера (" + list.size + ")"
+        } else {
+            val key = albumKeyNow()
+            if (key != null && key == albumKey && albumTracks.isNotEmpty()) {
+                list = albumTracks
+                trackSource = "альбом из библиотеки (" + list.size + ")"
+            } else {
+                // Крайний случай: хотя бы играющий трек
+                list = listOf(TrackItem(-1L, songTitle, null, trackDurationMs))
+                trackSource = "только играющий трек"
+                loadAlbumAsync()
+            }
+        }
         tracks = list
         if (sheetVisible) loadDurationsAsync(list)
         loadFormatAsync(currentTrackUri())
@@ -1028,7 +1154,58 @@ class WalkmanRemoteView(context: Context) : View(context) {
         if (tracks.isEmpty()) return -1
         val byId = tracks.indexOfFirst { it.queueId >= 0 && it.queueId == activeQueueId }
         if (byId >= 0) return byId
-        return tracks.indexOfFirst { it.title == songTitle }
+        val name = songTitle.trim()
+        val byTitle = tracks.indexOfFirst { it.title.trim().equals(name, ignoreCase = true) }
+        if (byTitle >= 0) return byTitle
+        if (currentTrackNo > 0) {
+            // В библиотеке номер песни может храниться как 1001 (диск 1, песня 1)
+            return tracks.indexOfFirst { it.trackNo > 0 && it.trackNo % 1000 == currentTrackNo }
+        }
+        return -1
+    }
+
+    private fun albumKeyNow(): String? =
+        if (currentAlbum.isBlank()) null else currentAlbum + "|" + artistName
+
+    private fun audioPermission(): String =
+        if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
+        else Manifest.permission.READ_EXTERNAL_STORAGE
+
+    private fun hasAudioPermission(): Boolean = try {
+        context.checkSelfPermission(audioPermission()) == PackageManager.PERMISSION_GRANTED
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun loadAlbumAsync() {
+        val key = albumKeyNow() ?: return
+        if (albumLoading || key == albumKey) return
+        if (!hasAudioPermission()) return
+        albumLoading = true
+        val album = currentAlbum
+        val artist = artistName
+        Thread {
+            val res = TrackLoader.fromAlbum(context, album, artist)
+            mainHandler.post {
+                albumLoading = false
+                albumTracks = res
+                albumKey = key
+                // Если за это время сменился альбом, rebuildTracks запустит новую загрузку
+                rebuildTracks()
+            }
+        }.start()
+    }
+
+    private fun showInfo(title: String, text: String) {
+        try {
+            AlertDialog.Builder(context)
+                .setTitle(title)
+                .setMessage(text)
+                .setPositiveButton("OK", null)
+                .show()
+        } catch (e: Exception) {
+            Toast.makeText(context, text, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun refreshHeader(meta: MediaMetadata) {
@@ -1111,11 +1288,11 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // Спрашиваем один раз и только если плеер отдал адреса файлов.
     private fun ensureAudioPermission() {
         try {
-            if (tracks.none { it.uri != null } && currentTrackUri() == null) return
-            if (context.checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED) return
-            if (prefs.getBoolean("audio_perm_asked", false)) return
-            prefs.edit().putBoolean("audio_perm_asked", true).apply()
-            (context as? Activity)?.requestPermissions(arrayOf(Manifest.permission.READ_MEDIA_AUDIO), 7)
+            if (hasAudioPermission()) return
+            val asked = prefs.getInt("audio_perm_asks", 0)
+            if (asked >= 2) return
+            prefs.edit().putInt("audio_perm_asks", asked + 1).apply()
+            (context as? Activity)?.requestPermissions(arrayOf(audioPermission()), 7)
         } catch (e: Exception) {
         }
     }
@@ -1215,7 +1392,9 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
         canvas.drawText(hdrArtistShown, Design.SHEET_TEXT_X, Design.SHEET_LINE1_BASE, flexPaint)
         canvas.drawText(hdrAlbumShown, Design.SHEET_TEXT_X, Design.SHEET_LINE2_BASE, flexPaint)
-        canvas.drawText(hdrYear, Design.SHEET_TEXT_X, Design.SHEET_LINE3_BASE, flexPaint)
+        val yearFromLib = (tracks.getOrNull(activeIndex())?.year ?: 0)
+        val yearText = if (hdrYear.isNotEmpty()) hdrYear else if (yearFromLib > 0) yearFromLib.toString() else ""
+        canvas.drawText(yearText, Design.SHEET_TEXT_X, Design.SHEET_LINE3_BASE, flexPaint)
         if (hdrFormat.isNotEmpty()) {
             canvas.drawText(hdrFormat, Design.SHEET_TEXT_X, Design.SHEET_FORMAT_BASE, smallMonoPaint)
         }
@@ -1431,31 +1610,54 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private fun playTrackAt(index: Int) {
         val ctrl = WalkmanNotificationListener.activeController ?: return
         val item = tracks.getOrNull(index) ?: return
-        if (item.queueId < 0) return
         val actions = ctrl.playbackState?.actions ?: 0L
-        if ((actions and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM) != 0L) {
+        if (item.queueId >= 0 && (actions and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM) != 0L) {
             ctrl.transportControls.skipToQueueItem(item.queueId)
-        } else {
-            // Плеер не умеет прыгать на песню по номеру: листаем кнопками "вперёд" и "назад"
-            val from = activeIndex()
-            if (from >= 0) stepToTrack(index - from)
+            return
+        }
+
+        // Очереди нет: листаем кнопками "вперёд" и "назад" (порядок как в альбоме),
+        // потом проверяем, что включилась нужная песня
+        val from = activeIndex()
+        if (from >= 0 && from != index) {
+            stepToTrack(index - from, item)
+        } else if (from < 0) {
+            playByUri(item)
         }
     }
 
-    private fun stepToTrack(diff: Int) {
+    private fun playByUri(item: TrackItem) {
+        val ctrl = WalkmanNotificationListener.activeController ?: return
+        val uri = item.uri ?: return
+        val actions = ctrl.playbackState?.actions ?: 0L
+        if ((actions and PlaybackState.ACTION_PLAY_FROM_URI) != 0L) {
+            ctrl.transportControls.playFromUri(uri, Bundle())
+        }
+    }
+
+    private fun stepToTrack(diff: Int, target: TrackItem) {
         if (diff == 0) return
         val tc = WalkmanNotificationListener.activeController?.transportControls ?: return
         var left = abs(diff).coerceAtMost(60)
         val forward = diff > 0
         val r = object : Runnable {
             override fun run() {
-                if (left <= 0) return
+                if (left <= 0) {
+                    mainHandler.postDelayed({ verifyLanded(target) }, 900L)
+                    return
+                }
                 left--
                 if (forward) tc.skipToNext() else tc.skipToPrevious()
-                if (left > 0) mainHandler.postDelayed(this, 250L)
+                mainHandler.postDelayed(this, 250L)
             }
         }
         r.run()
+    }
+
+    // Если после перелистывания играет не та песня, пробуем включить её по адресу файла
+    private fun verifyLanded(target: TrackItem) {
+        if (songTitle.trim().equals(target.title.trim(), ignoreCase = true)) return
+        playByUri(target)
     }
 
     // ------------------------------------------------------------------

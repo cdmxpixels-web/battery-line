@@ -1,6 +1,8 @@
 package com.walkman.remote
 
+import android.content.ContentUris
 import android.content.Context
+import android.provider.MediaStore
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -14,7 +16,9 @@ class TrackItem(
     val queueId: Long,
     val title: String,
     val uri: Uri?,
-    var durationMs: Long
+    var durationMs: Long,
+    val trackNo: Int = 0,
+    val year: Int = 0
 ) {
     // Название, обрезанное под ширину строки (запоминаем, чтобы не считать каждый кадр)
     var shownTitle: String? = null
@@ -36,6 +40,58 @@ object TrackLoader {
             out.add(TrackItem(q.queueId, title, d.mediaUri, durationFromExtras(d.extras)))
         }
         return out
+    }
+
+    /**
+     * Песни альбома из музыкальной библиотеки плеера (нужен доступ к музыке).
+     * Используется, когда плеер Sony не отдаёт очередь воспроизведения.
+     */
+    fun fromAlbum(context: Context, album: String, artist: String?): List<TrackItem> {
+        if (album.isBlank()) return emptyList()
+        val pairs = ArrayList<Pair<TrackItem, String>>()
+        val base = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        val proj = arrayOf(
+            MediaStore.Audio.Media._ID,
+            MediaStore.Audio.Media.TITLE,
+            MediaStore.Audio.Media.TRACK,
+            MediaStore.Audio.Media.DURATION,
+            MediaStore.Audio.Media.YEAR,
+            MediaStore.Audio.Media.ARTIST
+        )
+        try {
+            val cursor = context.contentResolver.query(
+                base,
+                proj,
+                MediaStore.Audio.Media.ALBUM + " = ?",
+                arrayOf(album),
+                MediaStore.Audio.Media.TRACK + " ASC, " + MediaStore.Audio.Media.TITLE + " ASC"
+            )
+            cursor?.use { c ->
+                while (c.moveToNext()) {
+                    val title = c.getString(1)
+                    if (title.isNullOrBlank()) continue
+                    val item = TrackItem(
+                        -1L,
+                        title,
+                        ContentUris.withAppendedId(base, c.getLong(0)),
+                        c.getLong(3),
+                        c.getInt(2),
+                        c.getInt(4)
+                    )
+                    pairs.add(Pair(item, c.getString(5) ?: ""))
+                }
+            }
+        } catch (e: Exception) {
+        }
+        if (pairs.isEmpty()) return emptyList()
+
+        // В разных альбомах бывает одинаковое название: оставляем песни нужного исполнителя
+        val same = if (!artist.isNullOrBlank()) {
+            pairs.filter { it.second.equals(artist, ignoreCase = true) }
+        } else {
+            emptyList()
+        }
+        return (if (same.isNotEmpty()) same else pairs).map { it.first }
     }
 
     private fun durationFromExtras(extras: Bundle?): Long {

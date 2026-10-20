@@ -21,6 +21,7 @@ class WalkmanNotificationListener : NotificationListenerService() {
         var activeController: MediaController? = null
         var onStateChanged: ((PlaybackState?) -> Unit)? = null
         var onMetadataChanged: ((MediaMetadata?) -> Unit)? = null
+        var onQueueChanged: (() -> Unit)? = null
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -35,8 +36,8 @@ class WalkmanNotificationListener : NotificationListenerService() {
         }
 
         override fun onQueueChanged(queue: MutableList<android.media.session.MediaSession.QueueItem>?) {
-            // Очередь поменялась: обновим счётчик "1/10" заново
-            handler.post { onStateChanged?.invoke(activeController?.playbackState) }
+            // Очередь поменялась: обновим счётчик "1/10" и список треков
+            handler.post { onQueueChanged?.invoke() }
         }
     }
 
@@ -85,6 +86,7 @@ class WalkmanNotificationListener : NotificationListenerService() {
                 handler.post {
                     onMetadataChanged?.invoke(sonySession.metadata)
                     onStateChanged?.invoke(sonySession.playbackState)
+                    onQueueChanged?.invoke()
                 }
             }
         } catch (e: Exception) {

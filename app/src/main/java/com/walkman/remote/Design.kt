@@ -80,6 +80,38 @@ object Design {
     const val PLACEHOLDER_MAX_RANGE = 140    // разница между тёмным и светлым (0..255)
     const val CLONG_PRESS_MS = 700L          // долгое нажатие на "C" показывает данные об обложке
 
+    // ---- Громкость: если звук в наушниках не меняется ----
+    // true = при каждом изменении показывать системную панель громкости Sony
+    const val VOLUME_SHOW_PANEL = false
+
+    // ---- Экран со списком треков ----
+    const val SHEET_HEADER_BOTTOM = 411.5f   // низ шапки (название альбома + обложка)
+    const val SHEET_COVER_X = 360f           // левый край квадрата с обложкой
+    const val SHEET_TEXT_X = 20f
+    const val SHEET_TEXT_MAX_W = 320f        // ширина текста слева от обложки
+    const val SHEET_LINE1_BASE = 118f        // группа
+    const val SHEET_LINE2_BASE = 163f        // альбом
+    const val SHEET_LINE3_BASE = 208f        // год
+    const val SHEET_FORMAT_BASE = 371f       // строка "FLAC 44,1 кГц / 16 бит"
+    const val SMALL_SIZE = 18f               // Roboto Mono для строки формата
+    const val PLACEHOLDER_SQ = 42f           // красный квадрат, если нет обложки
+
+    const val ROW_H = 147.5f                 // высота строки с песней
+    const val ROW_NUM_X = 20f                // номер песни
+    const val ROW_TITLE_X = 81f              // название песни
+    const val ROW_TIME_RIGHT = 684f          // правый край времени
+    const val ROW_BASE = 84.5f               // линия текста от верха строки
+    const val ROW_TITLE_MAX_W = 495f         // дальше название обрезается многоточием
+
+    const val SHEET_OPEN_MS = 280L           // скорость появления
+    const val SHEET_CLOSE_MS = 220L          // скорость закрытия
+    const val SHEET_DISMISS_FRACTION = 0.25f // насколько оттянуть вниз, чтобы закрыть
+    const val SHEET_DISMISS_VELOCITY = 1500f // или так быстро смахнуть вниз
+    const val FLING_MIN_V = 200f             // с какой скорости список "катится" дальше
+
+    const val UNIT_KHZ = "кГц"               // в макете было "гГц", это опечатка
+    const val UNIT_BIT = "бит"
+
     // ---- Поведение ----
     const val SCRUB_MS_PER_TURN = 30000f   // полный оборот диска = 30 секунд
     const val DISC_DEG_PER_MS = 0.06f      // скорость вращения диска при игре

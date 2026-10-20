@@ -11,6 +11,8 @@ import android.view.WindowManager
 
 class MainActivity : Activity() {
 
+    private var remoteView: WalkmanRemoteView? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -18,7 +20,9 @@ class MainActivity : Activity() {
         // Физические кнопки громкости управляют именно громкостью музыки
         volumeControlStream = AudioManager.STREAM_MUSIC
 
-        setContentView(WalkmanRemoteView(this))
+        val view = WalkmanRemoteView(this)
+        remoteView = view
+        setContentView(view)
         checkNotificationPermission()
     }
 
@@ -30,6 +34,23 @@ class MainActivity : Activity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) hideSystemUI()
+    }
+
+    // Кнопка "назад" сначала закрывает список треков
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (remoteView?.handleBack() == true) return
+        super.onBackPressed()
+    }
+
+    // Ответ на запрос доступа к музыкальным файлам (для времени и формата треков)
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        remoteView?.onPermissionResult()
     }
 
     private fun hideSystemUI() {

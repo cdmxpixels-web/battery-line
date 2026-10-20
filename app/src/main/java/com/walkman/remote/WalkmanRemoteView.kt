@@ -1,11 +1,17 @@
 package com.walkman.remote
 
 import android.annotation.SuppressLint
+import android.Manifest
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
+import android.app.Activity
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -18,7 +24,9 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.AudioManager
 import android.media.MediaMetadata
+import android.media.session.MediaController
 import android.media.session.PlaybackState
+import android.net.Uri
 import android.os.BatteryManager
 import android.os.Environment
 import android.os.Handler
@@ -26,14 +34,18 @@ import android.os.Looper
 import android.os.StatFs
 import android.os.SystemClock
 import android.view.MotionEvent
+import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.animation.DecelerateInterpolator
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -44,7 +56,9 @@ import kotlin.math.roundToInt
 @SuppressLint("ViewConstructor")
 class WalkmanRemoteView(context: Context) : View(context) {
 
-    private enum class Mode { NONE, DISC, VOLUME, PREV, NEXT, COLOR }
+    private enum class Mode { NONE, DISC, VOLUME, PREV, NEXT, COLOR, TITLE }
+
+    private enum class SheetGesture { NONE, PENDING, SCROLL, DRAG_SHEET, SEEK, IGNORE }
 
     // ------------------------------------------------------------------
     // Настройки и шрифты
@@ -174,6 +188,65 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var volStartPercent = 0
     private var lastSentVolume = -1
     private var toastShownForThisDrag = false
+    private var volDownTime = 0L
+    private var volMoved = false
+
+    // ------------------------------------------------------------------
+    // Список треков: состояние
+    // ------------------------------------------------------------------
+    private var sheetVisible = false
+    private var sheetY = Design.H            // 0 = экран открыт, H = спрятан внизу
+    private var sheetAnimator: ValueAnimator? = null
+    private var listScroll = 0f
+    private var listFlingV = 0f
+    private var flingLast = 0L
+    private var listSeeking = false
+
+    private var tracks: List<TrackItem> = emptyList()
+    private var activeQueueId = -1L
+    private var loadGeneration = 0
+    private var formatKey: String? = null
+
+    private var coverSquare: Bitmap? = null
+    private var hdrArtistShown = ""
+    private var hdrAlbumShown = ""
+    private var hdrYear = ""
+    private var hdrFormat = ""
+
+    private var sg = SheetGesture.NONE
+    private var sgDownX = 0f
+    private var sgDownY = 0f
+    private var sgLastY = 0f
+    private var sgAtTop = true
+    private var sgOnActive = false
+    private var velocity: VelocityTracker? = null
+
+    private val blackPaint = Paint().apply {
+        color = Color.BLACK
+        style = Paint.Style.FILL
+    }
+    private val smallMonoPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        typeface = monoFace
+        textSize = Design.SMALL_SIZE
+    }
+
+    private val flingRunnable = object : Runnable {
+        override fun run() {
+            val now = SystemClock.uptimeMillis()
+            val dt = (now - flingLast).coerceAtLeast(1L)
+            flingLast = now
+            val max = maxScroll()
+            listScroll = (listScroll + listFlingV * dt / 1000f).coerceIn(0f, max)
+            listFlingV *= exp(-dt / 400f)
+            if (abs(listFlingV) < 30f || listScroll <= 0f || listScroll >= max) {
+                listFlingV = 0f
+            } else {
+                postOnAnimation(this)
+            }
+            invalidate()
+        }
+    }
 
     // ------------------------------------------------------------------
     // Анимация и фоновые обновления
@@ -186,7 +259,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
             val now = SystemClock.uptimeMillis()
             val dt = now - lastFrameTime
             lastFrameTime = now
-            if (isPlaying && !scrubbing) {
+            if (isPlaying && !scrubbing && !listSeeking) {
                 discAngle = (discAngle + dt * Design.DISC_DEG_PER_MS) % 360f
                 currentPositionMs = (currentPositionMs + dt).coerceIn(0L, maxPosition())
             }
@@ -250,6 +323,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
         WalkmanNotificationListener.onMetadataChanged = { meta -> applyMetadata(meta) }
         WalkmanNotificationListener.onStateChanged = { state -> applyState(state) }
+        WalkmanNotificationListener.onQueueChanged = { onQueueUpdated() }
 
         // Если сессия уже найдена, сразу подтянем текущий трек
         WalkmanNotificationListener.activeController?.let {
@@ -257,6 +331,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
             applyState(it.playbackState)
         }
 
+        rebuildTracks()
         postDelayed(housekeeping, 300)
         invalidate()
     }
@@ -269,6 +344,10 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
         WalkmanNotificationListener.onMetadataChanged = null
         WalkmanNotificationListener.onStateChanged = null
+        WalkmanNotificationListener.onQueueChanged = null
+        sheetAnimator?.cancel()
+        loadGeneration++
+        removeCallbacks(flingRunnable)
         removeCallbacks(housekeeping)
         removeCallbacks(frameRunnable)
         frameLoopRunning = false
@@ -321,11 +400,17 @@ class WalkmanRemoteView(context: Context) : View(context) {
         val raw = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: meta.getBitmap(MediaMetadata.METADATA_KEY_ART)
             ?: meta.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
-        coverBitmap = if (raw != null && !looksLikePlaceholder(raw)) makeCover(raw) else null
+        // Заглушку Sony (серая нота) не показываем
+        val usableRaw = raw?.takeIf { !looksLikePlaceholder(it) }
+        coverBitmap = usableRaw?.let { makeCover(it) }
+        coverSquare = usableRaw?.let { makeSquareCover(it) }
         if (raw == null) lastCoverInfo = "Обложки нет в метаданных"
 
         titleShown = fit(songTitle, flexPaint, Design.TEXT_MAX_W)
         artistShown = fit(artistName, flexPaint, Design.TEXT_MAX_W)
+
+        if (tracks.size <= 1) rebuildTracks()
+        refreshHeader(meta)
 
         refreshTrackText(meta)
         shownSecond = -1L
@@ -335,6 +420,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private fun applyState(state: PlaybackState?) {
         if (state == null) return
         isPlaying = state.state == PlaybackState.STATE_PLAYING
+        activeQueueId = state.activeQueueItemId
 
         var pos = state.position
         if (pos < 0) pos = 0
@@ -453,10 +539,14 @@ class WalkmanRemoteView(context: Context) : View(context) {
         accentPaint.color = accentColor
         updateTimeStrings()
 
-        drawTopRow(canvas)
-        drawDisc(canvas)
-        drawTitleRow(canvas)
-        drawVolume(canvas)
+        // Когда список закрывает весь экран, главный экран под ним не рисуем
+        if (!(sheetVisible && sheetY <= 0f)) {
+            drawTopRow(canvas)
+            drawDisc(canvas)
+            drawTitleRow(canvas)
+            drawVolume(canvas)
+        }
+        if (sheetVisible) drawSheet(canvas)
 
         canvas.restore()
     }
@@ -586,6 +676,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
         val x = event.x * Design.W / width
         val y = event.y * Design.H / height
 
+        if (sheetVisible) return handleSheetTouch(event, x, y)
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> onDown(x, y)
             MotionEvent.ACTION_MOVE -> onMove(x, y)
@@ -642,6 +734,11 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 pressedCell = 2
                 startLongPress(1)
                 invalidate()
+            } else {
+                // Поле с названием: по нажатию откроется список треков
+                mode = Mode.TITLE
+                downX = x
+                downY = y
             }
             return
         }
@@ -653,6 +750,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
             volStartPercent = volumePercent
             lastSentVolume = -1
             toastShownForThisDrag = false
+            volDownTime = SystemClock.uptimeMillis()
+            volMoved = false
         }
     }
 
@@ -680,6 +779,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
             Mode.VOLUME -> {
                 val p = volumeProgress(x, y)
+                if (abs(p - volStartProgress) > 0.01f) volMoved = true
                 val target = (volStartPercent + (p - volStartProgress) * 100f * Design.VOLUME_GAIN)
                     .coerceIn(0f, 100f).roundToInt()
                 if (target != volumePercent) {
@@ -717,14 +817,24 @@ class WalkmanRemoteView(context: Context) : View(context) {
             }
 
             Mode.VOLUME -> {
+                // Долгое удержание без движения: показать сведения о громкости (для настройки)
+                if (!volMoved && !cancelled &&
+                    SystemClock.uptimeMillis() - volDownTime >= Design.CLONG_PRESS_MS
+                ) {
+                    Toast.makeText(context, volumeDiagnostics(), Toast.LENGTH_LONG).show()
+                }
                 finishVolumeDrag()
+            }
+
+            Mode.TITLE -> {
+                if (!cancelled && hypot(x - downX, y - downY) < touchSlop * 2f) openSheet()
             }
 
             Mode.COLOR -> {
                 if (!cancelled && hypot(x - Design.C_CX, y - Design.C_CY) <= Design.C_R + 12f) {
                     if (SystemClock.uptimeMillis() - colorDownTime >= Design.CLONG_PRESS_MS) {
                         // Долгое нажатие: показать данные об обложке (для настройки)
-                        Toast.makeText(context, lastCoverInfo, Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, lastCoverInfo + "\n" + queueInfo(), Toast.LENGTH_LONG).show()
                     } else {
                         showColorPickerDialog()
                     }
@@ -782,8 +892,67 @@ class WalkmanRemoteView(context: Context) : View(context) {
         if (target == lastSentVolume) return
         lastSentVolume = target
         try {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+            val flags = if (Design.VOLUME_SHOW_PANEL) AudioManager.FLAG_SHOW_UI else 0
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, flags)
         } catch (e: Exception) {
+        }
+
+        // Если сессия плеера использует собственную громкость, передаём значение и ей
+        try {
+            val ctrl = WalkmanNotificationListener.activeController
+            val info = ctrl?.playbackInfo
+            if (ctrl != null && info != null &&
+                info.playbackType == MediaController.PlaybackInfo.PLAYBACK_TYPE_REMOTE &&
+                info.maxVolume > 0
+            ) {
+                ctrl.setVolumeTo((percent * info.maxVolume / 100f).roundToInt(), 0)
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    // Сведения о громкости для настройки (долгое удержание пальца на полукруге)
+    private fun volumeDiagnostics(): String {
+        val sb = StringBuilder()
+        try {
+            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            sb.append("Громкость: $cur из $max")
+        } catch (e: Exception) {
+        }
+        try {
+            sb.append(", фиксированная: ").append(audioManager.isVolumeFixed)
+        } catch (e: Exception) {
+        }
+        try {
+            val devs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                .joinToString(",") { it.type.toString() }
+            sb.append("\nВыходы (типы): ").append(devs)
+        } catch (e: Exception) {
+        }
+        try {
+            val info = WalkmanNotificationListener.activeController?.playbackInfo
+            if (info != null) {
+                if (info.playbackType == MediaController.PlaybackInfo.PLAYBACK_TYPE_REMOTE) {
+                    sb.append("\nСессия плеера: своя громкость ${info.currentVolume} из ${info.maxVolume}")
+                } else {
+                    sb.append("\nСессия плеера: системная громкость")
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return sb.toString()
+    }
+
+    private fun queueInfo(): String {
+        return try {
+            val ctrl = WalkmanNotificationListener.activeController
+            val n = ctrl?.queue?.size ?: 0
+            val acts = ctrl?.playbackState?.actions ?: 0L
+            val canJump = (acts and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM) != 0L
+            "В очереди $n треков, переход по номеру: " + if (canJump) "есть" else "нет"
+        } catch (e: Exception) {
+            "Очередь недоступна"
         }
     }
 
@@ -817,6 +986,476 @@ class WalkmanRemoteView(context: Context) : View(context) {
         } catch (e: Exception) {
         }
         syncVolumeFromSystem()
+    }
+
+    // ------------------------------------------------------------------
+    // Список треков: данные
+    // ------------------------------------------------------------------
+    fun handleBack(): Boolean {
+        if (!sheetVisible) return false
+        closeSheet()
+        return true
+    }
+
+    // Пользователь ответил на запрос доступа к файлам: пробуем снова прочитать время и формат
+    fun onPermissionResult() {
+        formatKey = null
+        loadDurationsAsync(tracks)
+        loadFormatAsync(currentTrackUri())
+    }
+
+    private fun onQueueUpdated() {
+        refreshTrackText(WalkmanNotificationListener.activeController?.metadata)
+        rebuildTracks()
+    }
+
+    private fun rebuildTracks() {
+        val q = try {
+            WalkmanNotificationListener.activeController?.queue
+        } catch (e: Exception) {
+            null
+        }
+        var list = TrackLoader.fromQueue(q)
+        // Если плеер не отдаёт очередь, показываем хотя бы играющий трек
+        if (list.isEmpty()) list = listOf(TrackItem(-1L, songTitle, null, trackDurationMs))
+        tracks = list
+        if (sheetVisible) loadDurationsAsync(list)
+        loadFormatAsync(currentTrackUri())
+        invalidate()
+    }
+
+    private fun activeIndex(): Int {
+        if (tracks.isEmpty()) return -1
+        val byId = tracks.indexOfFirst { it.queueId >= 0 && it.queueId == activeQueueId }
+        if (byId >= 0) return byId
+        return tracks.indexOfFirst { it.title == songTitle }
+    }
+
+    private fun refreshHeader(meta: MediaMetadata) {
+        hdrArtistShown = fit(artistName, flexPaint, Design.SHEET_TEXT_MAX_W)
+        val album = meta.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
+        hdrAlbumShown = fit(album, flexPaint, Design.SHEET_TEXT_MAX_W)
+
+        val year = meta.getLong(MediaMetadata.METADATA_KEY_YEAR)
+        hdrYear = if (year > 0) {
+            year.toString()
+        } else {
+            val first = (meta.getString(MediaMetadata.METADATA_KEY_DATE) ?: "").take(4)
+            if (first.length == 4 && first.all { ch -> ch.isDigit() }) first else ""
+        }
+        loadFormatAsync(currentTrackUri(meta))
+    }
+
+    private fun currentTrackUri(
+        meta: MediaMetadata? = WalkmanNotificationListener.activeController?.metadata
+    ): Uri? {
+        try {
+            val s = meta?.getString(MediaMetadata.METADATA_KEY_MEDIA_URI)
+            if (!s.isNullOrBlank()) return Uri.parse(s)
+            val idx = activeIndex()
+            if (idx >= 0) return tracks[idx].uri
+        } catch (e: Exception) {
+        }
+        return null
+    }
+
+    // Квадратная обложка для шапки списка (с обрезкой по центру)
+    private fun makeSquareCover(bmp: Bitmap): Bitmap {
+        val size = (Design.W - Design.SHEET_COVER_X).toInt()
+        val side = min(bmp.width, bmp.height)
+        val left = (bmp.width - side) / 2
+        val top = (bmp.height - side) / 2
+        val out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        Canvas(out).drawBitmap(bmp, Rect(left, top, left + side, top + side), Rect(0, 0, size, size), coverPaint)
+        return out
+    }
+
+    private fun loadFormatAsync(uri: Uri?) {
+        if (uri == null) {
+            formatKey = null
+            hdrFormat = ""
+            return
+        }
+        val key = uri.toString()
+        if (key == formatKey) return
+        formatKey = key
+        hdrFormat = ""
+        Thread {
+            val f = TrackLoader.readFormat(context, uri)
+            mainHandler.post {
+                if (formatKey == key) {
+                    hdrFormat = f ?: ""
+                    invalidate()
+                }
+            }
+        }.start()
+    }
+
+    private fun loadDurationsAsync(list: List<TrackItem>) {
+        val pending = list.filter { it.durationMs <= 0 && it.uri != null }
+        if (pending.isEmpty()) return
+        val gen = ++loadGeneration
+        Thread {
+            for (t in pending) {
+                if (gen != loadGeneration) return@Thread
+                val d = TrackLoader.readDuration(context, t.uri!!)
+                if (d > 0) {
+                    t.durationMs = d
+                    mainHandler.post { invalidate() }
+                }
+            }
+        }.start()
+    }
+
+    // Доступ к музыкальным файлам нужен только чтобы показать время и формат.
+    // Спрашиваем один раз и только если плеер отдал адреса файлов.
+    private fun ensureAudioPermission() {
+        try {
+            if (tracks.none { it.uri != null } && currentTrackUri() == null) return
+            if (context.checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED) return
+            if (prefs.getBoolean("audio_perm_asked", false)) return
+            prefs.edit().putBoolean("audio_perm_asked", true).apply()
+            (context as? Activity)?.requestPermissions(arrayOf(Manifest.permission.READ_MEDIA_AUDIO), 7)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun formatTime(ms: Long): String {
+        val s = ms / 1000
+        return String.format(Locale.US, "%02d:%02d", s / 60, s % 60)
+    }
+
+    private fun maxScroll(): Float {
+        val contentH = Design.SHEET_HEADER_BOTTOM + tracks.size * Design.ROW_H
+        return (contentH - Design.H).coerceAtLeast(0f)
+    }
+
+    // ------------------------------------------------------------------
+    // Список треков: открытие и закрытие
+    // ------------------------------------------------------------------
+    private fun openSheet() {
+        if (sheetVisible) return
+        rebuildTracks()
+        ensureAudioPermission()
+        loadDurationsAsync(tracks)
+
+        // Сразу показать играющий трек, если он не помещается на экране
+        listScroll = 0f
+        val idx = activeIndex()
+        if (idx >= 0) {
+            val bottom = Design.SHEET_HEADER_BOTTOM + (idx + 1) * Design.ROW_H
+            if (bottom > Design.H) {
+                listScroll = (bottom - Design.H + Design.ROW_H).coerceIn(0f, maxScroll())
+            }
+        }
+
+        sheetVisible = true
+        sheetY = Design.H
+        animateSheet(0f, Design.SHEET_OPEN_MS, null)
+    }
+
+    private fun closeSheet() {
+        animateSheet(Design.H, Design.SHEET_CLOSE_MS) {
+            sheetVisible = false
+            listFlingV = 0f
+            invalidate()
+        }
+    }
+
+    private fun animateSheet(to: Float, durationMs: Long, endAction: (() -> Unit)?) {
+        sheetAnimator?.cancel()
+        val a = ValueAnimator.ofFloat(sheetY, to)
+        a.duration = durationMs
+        a.interpolator = DecelerateInterpolator()
+        a.addUpdateListener {
+            sheetY = it.animatedValue as Float
+            invalidate()
+        }
+        a.addListener(object : AnimatorListenerAdapter() {
+            private var cancelled = false
+
+            override fun onAnimationCancel(animation: Animator) {
+                cancelled = true
+            }
+
+            override fun onAnimationEnd(animation: Animator) {
+                if (!cancelled) endAction?.invoke()
+            }
+        })
+        sheetAnimator = a
+        a.start()
+    }
+
+    // ------------------------------------------------------------------
+    // Список треков: рисование
+    // ------------------------------------------------------------------
+    private fun drawSheet(canvas: Canvas) {
+        canvas.save()
+        canvas.translate(0f, sheetY)
+        canvas.drawRect(0f, 0f, Design.W, Design.H, blackPaint)
+
+        // Прокручиваемая часть: шапка и строки с песнями
+        canvas.save()
+        canvas.clipRect(0f, Design.TOP_H, Design.W, Design.H)
+        canvas.translate(0f, -listScroll)
+        drawSheetHeader(canvas)
+        drawSheetRows(canvas)
+        canvas.restore()
+
+        // Верхняя строка B / M / SD всегда на месте
+        canvas.drawRect(0f, 0f, Design.W, Design.TOP_H, blackPaint)
+        drawTopRow(canvas)
+
+        canvas.restore()
+    }
+
+    private fun drawSheetHeader(canvas: Canvas) {
+        val top = Design.TOP_H
+        val bottom = Design.SHEET_HEADER_BOTTOM
+
+        canvas.drawText(hdrArtistShown, Design.SHEET_TEXT_X, Design.SHEET_LINE1_BASE, flexPaint)
+        canvas.drawText(hdrAlbumShown, Design.SHEET_TEXT_X, Design.SHEET_LINE2_BASE, flexPaint)
+        canvas.drawText(hdrYear, Design.SHEET_TEXT_X, Design.SHEET_LINE3_BASE, flexPaint)
+        if (hdrFormat.isNotEmpty()) {
+            canvas.drawText(hdrFormat, Design.SHEET_TEXT_X, Design.SHEET_FORMAT_BASE, smallMonoPaint)
+        }
+
+        val sq = coverSquare
+        if (sq != null) {
+            canvas.save()
+            canvas.clipRect(Design.SHEET_COVER_X, top, Design.W, bottom)
+            canvas.drawBitmap(sq, Design.SHEET_COVER_X, top, coverPaint)
+            canvas.restore()
+        } else {
+            // Обложки нет: диагональ и красный квадрат
+            canvas.drawLine(Design.SHEET_COVER_X, bottom, Design.W, top, linePaint)
+            val cx = (Design.SHEET_COVER_X + Design.W) / 2f
+            val cy = (top + bottom) / 2f
+            val h = Design.PLACEHOLDER_SQ / 2f
+            canvas.drawRect(cx - h, cy - h, cx + h, cy + h, accentPaint)
+        }
+
+        canvas.drawLine(Design.SHEET_COVER_X, top, Design.SHEET_COVER_X, bottom, linePaint)
+        canvas.drawLine(0f, bottom, Design.W, bottom, linePaint)
+    }
+
+    private fun drawSheetRows(canvas: Canvas) {
+        val list = tracks
+        if (list.isEmpty()) return
+
+        val base0 = Design.SHEET_HEADER_BOTTOM
+        val visTop = listScroll + Design.TOP_H
+        val visBottom = listScroll + Design.H
+        val first = maxOf(0, ((visTop - base0) / Design.ROW_H).toInt())
+        val last = minOf(list.size - 1, ((visBottom - base0) / Design.ROW_H).toInt())
+        val active = activeIndex()
+
+        for (i in first..last) {
+            val t = list[i]
+            val top = base0 + i * Design.ROW_H
+            val bot = top + Design.ROW_H
+
+            // Играющая песня постепенно заливается акцентным цветом
+            if (i == active) {
+                val p = if (trackDurationMs > 0) {
+                    (currentPositionMs.toFloat() / trackDurationMs).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+                if (p > 0f) canvas.drawRect(0f, top, Design.W * p, bot, accentPaint)
+            }
+
+            val base = top + Design.ROW_BASE
+            canvas.drawText((i + 1).toString(), Design.ROW_NUM_X, base, monoPaint)
+
+            var shown = t.shownTitle
+            if (shown == null) {
+                shown = fit(t.title, flexPaint, Design.ROW_TITLE_MAX_W)
+                t.shownTitle = shown
+            }
+            canvas.drawText(shown, Design.ROW_TITLE_X, base, flexPaint)
+
+            val dur = if (i == active && trackDurationMs > 0) trackDurationMs else t.durationMs
+            if (dur > 0) drawRight(canvas, formatTime(dur), Design.ROW_TIME_RIGHT, base, monoPaint)
+
+            canvas.drawLine(0f, bot, Design.W, bot, linePaint)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Список треков: касания
+    // ------------------------------------------------------------------
+
+    // Номер строки под пальцем (y в координатах экрана) или -1
+    private fun rowAt(y: Float): Int {
+        val local = y - sheetY
+        if (local <= Design.TOP_H) return -1
+        val cy = local + listScroll
+        if (cy < Design.SHEET_HEADER_BOTTOM) return -1
+        val i = ((cy - Design.SHEET_HEADER_BOTTOM) / Design.ROW_H).toInt()
+        return if (i in tracks.indices) i else -1
+    }
+
+    private fun handleSheetTouch(event: MotionEvent, x: Float, y: Float): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (sheetAnimator?.isRunning == true) sheetAnimator?.cancel()
+                removeCallbacks(flingRunnable)
+                listFlingV = 0f
+                sg = SheetGesture.PENDING
+                sgDownX = x
+                sgDownY = y
+                sgLastY = y
+                sgAtTop = listScroll <= 1f
+                val act = activeIndex()
+                sgOnActive = act >= 0 && rowAt(y) == act
+                velocity?.recycle()
+                velocity = VelocityTracker.obtain().also { it.addMovement(event) }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                velocity?.addMovement(event)
+                val dx = x - sgDownX
+                val dy = y - sgDownY
+
+                if (sg == SheetGesture.PENDING && hypot(dx, dy) > touchSlop) {
+                    sg = when {
+                        sgOnActive && abs(dx) > abs(dy) -> SheetGesture.SEEK
+                        abs(dy) >= abs(dx) && sgAtTop && dy > 0f -> SheetGesture.DRAG_SHEET
+                        abs(dy) >= abs(dx) -> SheetGesture.SCROLL
+                        else -> SheetGesture.IGNORE
+                    }
+                    if (sg == SheetGesture.SEEK) listSeeking = true
+                }
+
+                val step = y - sgLastY
+                when (sg) {
+                    SheetGesture.SCROLL -> {
+                        listScroll = (listScroll - step).coerceIn(0f, maxScroll())
+                    }
+
+                    SheetGesture.DRAG_SHEET -> {
+                        sheetY = (sheetY + step).coerceAtLeast(0f)
+                        // Палец пошёл обратно вверх: дальше просто прокручиваем список
+                        if (sheetY <= 0f && step < 0f) sg = SheetGesture.SCROLL
+                    }
+
+                    SheetGesture.SEEK -> seekPreview(x)
+
+                    else -> {
+                    }
+                }
+                sgLastY = y
+                invalidate()
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val cancelled = event.actionMasked == MotionEvent.ACTION_CANCEL
+                velocity?.addMovement(event)
+                velocity?.computeCurrentVelocity(1000)
+                val vy = (velocity?.yVelocity ?: 0f) * Design.H / height
+                velocity?.recycle()
+                velocity = null
+
+                when (sg) {
+                    SheetGesture.PENDING -> {
+                        if (!cancelled) onSheetTap(x, y)
+                    }
+
+                    SheetGesture.SEEK -> {
+                        if (!cancelled) commitSeek()
+                    }
+
+                    SheetGesture.SCROLL -> startFling(-vy)
+
+                    SheetGesture.DRAG_SHEET -> {
+                        val far = sheetY > Design.H * Design.SHEET_DISMISS_FRACTION
+                        val fast = vy > Design.SHEET_DISMISS_VELOCITY
+                        if (!cancelled && (far || fast)) {
+                            closeSheet()
+                        } else {
+                            animateSheet(0f, 180L, null)
+                        }
+                    }
+
+                    else -> {
+                    }
+                }
+
+                listSeeking = false
+                // Если экран остановился не в крайнем положении, возвращаем его на место
+                if (sg != SheetGesture.DRAG_SHEET && sheetY > 0f && sheetVisible &&
+                    sheetAnimator?.isRunning != true
+                ) {
+                    animateSheet(0f, 150L, null)
+                }
+                sg = SheetGesture.NONE
+                invalidate()
+            }
+        }
+        return true
+    }
+
+    private fun onSheetTap(x: Float, y: Float) {
+        val i = rowAt(y)
+        if (i < 0) return
+        if (i == activeIndex()) {
+            // Нажатие на играющую песню работает как перемотка в это место
+            seekPreview(x)
+            commitSeek()
+        } else {
+            playTrackAt(i)
+        }
+    }
+
+    // Перемотка: положение пальца по горизонтали = положение в треке
+    private fun seekPreview(x: Float) {
+        if (trackDurationMs > 0) {
+            currentPositionMs = (x / Design.W * trackDurationMs).toLong().coerceIn(0L, trackDurationMs)
+            shownSecond = -1L
+        }
+    }
+
+    private fun commitSeek() {
+        WalkmanNotificationListener.activeController?.transportControls?.seekTo(currentPositionMs)
+    }
+
+    private fun startFling(v: Float) {
+        if (abs(v) < Design.FLING_MIN_V) return
+        listFlingV = v
+        flingLast = SystemClock.uptimeMillis()
+        removeCallbacks(flingRunnable)
+        postOnAnimation(flingRunnable)
+    }
+
+    private fun playTrackAt(index: Int) {
+        val ctrl = WalkmanNotificationListener.activeController ?: return
+        val item = tracks.getOrNull(index) ?: return
+        if (item.queueId < 0) return
+        val actions = ctrl.playbackState?.actions ?: 0L
+        if ((actions and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM) != 0L) {
+            ctrl.transportControls.skipToQueueItem(item.queueId)
+        } else {
+            // Плеер не умеет прыгать на песню по номеру: листаем кнопками "вперёд" и "назад"
+            val from = activeIndex()
+            if (from >= 0) stepToTrack(index - from)
+        }
+    }
+
+    private fun stepToTrack(diff: Int) {
+        if (diff == 0) return
+        val tc = WalkmanNotificationListener.activeController?.transportControls ?: return
+        var left = abs(diff).coerceAtMost(60)
+        val forward = diff > 0
+        val r = object : Runnable {
+            override fun run() {
+                if (left <= 0) return
+                left--
+                if (forward) tc.skipToNext() else tc.skipToPrevious()
+                if (left > 0) mainHandler.postDelayed(this, 250L)
+            }
+        }
+        r.run()
     }
 
     // ------------------------------------------------------------------

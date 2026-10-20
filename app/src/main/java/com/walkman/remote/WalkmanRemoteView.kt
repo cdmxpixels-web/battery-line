@@ -162,6 +162,9 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var scrubbing = false
     private var lastAngle = 0f
 
+    // кнопка "C"
+    private var colorDownTime = 0L
+
     // стрелки
     private var longPressed = false
     private var seekRunnable: Runnable? = null
@@ -318,7 +321,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
         val raw = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: meta.getBitmap(MediaMetadata.METADATA_KEY_ART)
             ?: meta.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
-        coverBitmap = raw?.let { makeCover(it) }
+        coverBitmap = if (raw != null && !looksLikePlaceholder(raw)) makeCover(raw) else null
+        if (raw == null) lastCoverInfo = "Обложки нет в метаданных"
 
         titleShown = fit(songTitle, flexPaint, Design.TEXT_MAX_W)
         artistShown = fit(artistName, flexPaint, Design.TEXT_MAX_W)
@@ -368,6 +372,38 @@ class WalkmanRemoteView(context: Context) : View(context) {
     }
 
     private fun maxPosition(): Long = if (trackDurationMs > 0) trackDurationMs else Long.MAX_VALUE
+
+    // Плеер Sony для альбомов без обложки отдаёт свою серую картинку с нотой.
+    // Узнаём её по виду: почти нет цвета и небольшой контраст.
+    private var lastCoverInfo = "Данных об обложке пока нет"
+
+    private fun looksLikePlaceholder(bmp: Bitmap): Boolean {
+        return try {
+            val n = 32
+            val small = Bitmap.createScaledBitmap(bmp, n, n, true)
+            val px = IntArray(n * n)
+            small.getPixels(px, 0, n, 0, 0, n, n)
+            val lums = IntArray(n * n)
+            var chromaSum = 0L
+            for (i in px.indices) {
+                val c = px[i]
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                chromaSum += (maxOf(r, g, b) - minOf(r, g, b))
+                lums[i] = (r * 299 + g * 587 + b * 114) / 1000
+            }
+            lums.sort()
+            val chroma = chromaSum / (n * n)
+            val range = lums[(n * n * 0.95).toInt()] - lums[(n * n * 0.05).toInt()]
+            val hidden = chroma < Design.PLACEHOLDER_MAX_CHROMA && range < Design.PLACEHOLDER_MAX_RANGE
+            lastCoverInfo = "Обложка ${bmp.width}x${bmp.height}, цвет $chroma (порог ${Design.PLACEHOLDER_MAX_CHROMA}), " +
+                "контраст $range (порог ${Design.PLACEHOLDER_MAX_RANGE}), " + if (hidden) "скрыта как заглушка" else "показана"
+            hidden
+        } catch (e: Exception) {
+            false
+        }
+    }
 
     // Из обложки делаем круг нужного размера (с обрезкой по центру)
     private fun makeCover(bmp: Bitmap): Bitmap {
@@ -476,7 +512,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
         canvas.save()
         canvas.rotate(discAngle, cx, cy)
         canvas.drawLine(cx - r, cy, cx + r, cy, linePaint)
-        canvas.drawLine(cx, cy - r, cx, cy + r, linePaint)
+        // Вторая линия только внутри внутреннего круга (так на макете)
+        canvas.drawLine(cx, cy - Design.COVER_R, cx, cy + Design.COVER_R, linePaint)
         val cover = coverBitmap
         if (cover != null) {
             canvas.drawBitmap(cover, cx - cover.width / 2f, cy - cover.height / 2f, coverPaint)
@@ -579,6 +616,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         // Круглая кнопка "C"
         if (hypot(x - Design.C_CX, y - Design.C_CY) <= Design.C_R + 4f) {
             mode = Mode.COLOR
+            colorDownTime = SystemClock.uptimeMillis()
             return
         }
 
@@ -642,7 +680,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
             Mode.VOLUME -> {
                 val p = volumeProgress(x, y)
-                val target = (volStartPercent + (p - volStartProgress) * 100f)
+                val target = (volStartPercent + (p - volStartProgress) * 100f * Design.VOLUME_GAIN)
                     .coerceIn(0f, 100f).roundToInt()
                 if (target != volumePercent) {
                     volumePercent = target
@@ -684,7 +722,12 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
             Mode.COLOR -> {
                 if (!cancelled && hypot(x - Design.C_CX, y - Design.C_CY) <= Design.C_R + 12f) {
-                    showColorPickerDialog()
+                    if (SystemClock.uptimeMillis() - colorDownTime >= Design.CLONG_PRESS_MS) {
+                        // Долгое нажатие: показать данные об обложке (для настройки)
+                        Toast.makeText(context, lastCoverInfo, Toast.LENGTH_LONG).show()
+                    } else {
+                        showColorPickerDialog()
+                    }
                 }
             }
 

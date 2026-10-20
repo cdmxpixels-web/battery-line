@@ -269,7 +269,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         removeCallbacks(housekeeping)
         removeCallbacks(frameRunnable)
         frameLoopRunning = false
-        cancelLongPress()
+        stopSeekRepeat()
     }
 
     // ------------------------------------------------------------------
@@ -657,7 +657,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
     }
 
     private fun onUp(x: Float, y: Float, cancelled: Boolean) {
-        cancelLongPress()
+        stopSeekRepeat()
 
         when (mode) {
             Mode.DISC -> {
@@ -725,7 +725,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         mainHandler.postDelayed(r, Design.LONG_PRESS_MS)
     }
 
-    private fun cancelLongPress() {
+    private fun stopSeekRepeat() {
         seekRunnable?.let { mainHandler.removeCallbacks(it) }
         seekRunnable = null
     }

@@ -38,7 +38,6 @@ import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
-import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -259,7 +258,6 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var frameLoopRunning = false
     private var spinK = 0f            // 0..1: разгон и торможение диска
     private var flipAngle = 0f        // дополнительный оборот при смене трека
-    private var flipAnimator: ValueAnimator? = null
     private var trackKey = ""
 
     private val frameRunnable = object : Runnable {
@@ -268,7 +266,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
             val dt = now - lastFrameTime
             lastFrameTime = now
 
-            val goal = if (isPlaying) 1f else 0f
+            val goal = if (isPlaying && !scrubbing && !listSeeking) 1f else 0f
+            if (scrubbing || listSeeking) spinK = 0f
             val stepK = dt / Design.DISC_RAMP_MS
             spinK = if (spinK < goal) min(goal, spinK + stepK) else maxOf(goal, spinK - stepK)
 
@@ -286,24 +285,28 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
     }
 
-    // Быстрый оборот диска: dir = 1 по часовой стрелке, -1 против
-    private fun startFlip(dir: Int) {
-        if (flipAnimator?.isRunning == true) return
-        val a = ValueAnimator.ofFloat(0f, 360f * dir)
-        a.duration = Design.DISC_FLIP_MS
-        a.interpolator = AccelerateDecelerateInterpolator()
-        a.addUpdateListener {
-            flipAngle = it.animatedValue as Float
+    // Быстрый оборот диска: dir = 1 по часовой стрелке, -1 против.
+    // Считаем по часам сами (системные анимации на плеере могут быть отключены).
+    private var flipStart = 0L
+    private var flipDir = 1
+
+    private val flipRunnable = object : Runnable {
+        override fun run() {
+            val t = ((SystemClock.uptimeMillis() - flipStart).toFloat() / Design.DISC_FLIP_MS).coerceIn(0f, 1f)
+            val eased = t * t * (3f - 2f * t)
+            flipAngle = if (t >= 1f) 0f else 360f * flipDir * eased
             invalidate()
+            if (t < 1f) postOnAnimation(this)
         }
-        a.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                flipAngle = 0f
-                invalidate()
-            }
-        })
-        flipAnimator = a
-        a.start()
+    }
+
+    private fun startFlip(dir: Int) {
+        if (flipAngle != 0f) return
+        flipDir = dir
+        flipStart = SystemClock.uptimeMillis()
+        flipAngle = 0.001f * dir
+        removeCallbacks(flipRunnable)
+        postOnAnimation(flipRunnable)
     }
 
     private fun ensureFrameLoop() {
@@ -397,7 +400,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         WalkmanNotificationListener.onQueueChanged = null
         sheetAnimator?.cancel()
         sheetXAnimator?.cancel()
-        flipAnimator?.cancel()
+        removeCallbacks(flipRunnable)
         loadGeneration++
         stepTarget = null
         mainHandler.removeCallbacks(stepRunnable)
@@ -1542,6 +1545,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         val ctrl = WalkmanNotificationListener.activeController ?: return
         val item = tracks.getOrNull(index) ?: return
         val actions = ctrl.playbackState?.actions ?: 0L
+        if (!isPlaying) ctrl.transportControls.play()
         if (item.queueId >= 0 && (actions and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM) != 0L) {
             ctrl.transportControls.skipToQueueItem(item.queueId)
             return
@@ -1608,6 +1612,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
             }
             if (cur == targetIdx) {
                 stepTarget = null
+                if (!isPlaying) tc.play()
                 return
             }
 

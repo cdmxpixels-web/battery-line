@@ -123,8 +123,8 @@ object Design {
     const val SEEK_REPEAT_MS = 300L        // как часто повторять шаг
 
     // ---- Анимации диска ----
-    const val DISC_RAMP_MS = 1000f         // разгон и торможение при play/pause
-    const val DISC_FLIP_MS = 1500L         // оборот диска при смене трека
+    const val DISC_RAMP_MS = 700f          // разгон и торможение при play/pause
+    const val DISC_FLIP_MS = 1050L         // оборот диска при смене трека
 
     // ---- Переход на выбранную песню в списке ----
     const val STEP_LOOKAHEAD = 4           // сколько команд "вперёд/назад" можно слать наперёд

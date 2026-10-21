@@ -78,11 +78,6 @@ object Design {
     // Если заглушка всё ещё видна, увеличьте.
     const val PLACEHOLDER_MAX_CHROMA = 25    // насколько картинка "цветная" (0..255)
     const val PLACEHOLDER_MAX_RANGE = 140    // разница между тёмным и светлым (0..255)
-    const val CLONG_PRESS_MS = 700L          // долгое нажатие на "C" показывает данные об обложке
-
-    // ---- Громкость: если звук в наушниках не меняется ----
-    // true = при каждом изменении показывать системную панель громкости Sony
-    const val VOLUME_SHOW_PANEL = false
 
     // ---- Громкость Sony ----
     // Плеер регулирует звук в наушниках своим параметром izm_master_volume (не громкостью Android).
@@ -114,6 +109,8 @@ object Design {
     const val SHEET_DISMISS_FRACTION = 0.25f // насколько оттянуть вниз, чтобы закрыть
     const val SHEET_DISMISS_VELOCITY = 1500f // или так быстро смахнуть вниз
     const val FLING_MIN_V = 200f             // с какой скорости список "катится" дальше
+    const val SHEET_SIDE_FRACTION = 0.3f     // насколько оттянуть вправо, чтобы закрыть
+    const val SHEET_SIDE_VELOCITY = 1200f    // или так быстро смахнуть вправо
 
     const val UNIT_KHZ = "кГц"               // в макете было "гГц", это опечатка
     const val UNIT_BIT = "бит"
@@ -124,4 +121,15 @@ object Design {
     const val LONG_PRESS_MS = 500L         // сколько держать стрелку до перемотки
     const val SEEK_STEP_MS = 5000L         // шаг перемотки при удержании
     const val SEEK_REPEAT_MS = 300L        // как часто повторять шаг
+
+    // ---- Анимации диска ----
+    const val DISC_RAMP_MS = 1000f         // разгон и торможение при play/pause
+    const val DISC_FLIP_MS = 1500L         // оборот диска при смене трека
+
+    // ---- Переход на выбранную песню в списке ----
+    const val STEP_LOOKAHEAD = 4           // сколько команд "вперёд/назад" можно слать наперёд
+    const val STEP_GAP_MS = 60L            // минимальная пауза между командами
+    const val STEP_TICK_MS = 25L           // как часто проверяем, что играет
+    const val STEP_STALL_MS = 1000L        // если за это время ничего не сменилось, досылаем шаги
+    const val PREV_RESTART_MS = 3000L      // "назад" позже этого времени лишь начинает песню заново
 }

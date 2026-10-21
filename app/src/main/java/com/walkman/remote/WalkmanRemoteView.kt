@@ -22,10 +22,8 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
-import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaMetadata
-import android.media.session.MediaController
 import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
@@ -40,6 +38,7 @@ import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -61,7 +60,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
     private enum class Mode { NONE, DISC, VOLUME, PREV, NEXT, COLOR, TITLE }
 
-    private enum class SheetGesture { NONE, PENDING, SCROLL, DRAG_SHEET, SEEK, IGNORE }
+    private enum class SheetGesture { NONE, PENDING, SCROLL, DRAG_SHEET, DRAG_SIDE, SEEK, IGNORE }
 
     // ------------------------------------------------------------------
     // Настройки и шрифты
@@ -179,9 +178,6 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var scrubbing = false
     private var lastAngle = 0f
 
-    // кнопка "C"
-    private var colorDownTime = 0L
-
     // стрелки
     private var longPressed = false
     private var seekRunnable: Runnable? = null
@@ -189,17 +185,15 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // громкость
     private var volStartProgress = 0f
     private var volStartPercent = 0
-    private var lastSentVolume = -1
-    private var toastShownForThisDrag = false
-    private var volDownTime = 0L
-    private var volMoved = false
 
     // ------------------------------------------------------------------
     // Список треков: состояние
     // ------------------------------------------------------------------
     private var sheetVisible = false
     private var sheetY = Design.H            // 0 = экран открыт, H = спрятан внизу
+    private var sheetX = 0f                  // сдвиг вправо при закрытии смахиванием вбок
     private var sheetAnimator: ValueAnimator? = null
+    private var sheetXAnimator: ValueAnimator? = null
     private var listScroll = 0f
     private var listFlingV = 0f
     private var flingLast = 0L
@@ -216,17 +210,6 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var albumTracks: List<TrackItem> = emptyList()
     private var albumKey: String? = null
     private var albumLoading = false
-    private var trackSource = "только играющий трек"
-
-    // Способ управления громкостью. Меняется в окне "Громкость":
-    // подержите палец на полукруге около секунды, не двигая.
-    private var volMethod = prefs.getInt("vol_method", 3)
-    private val volMethodNames = arrayOf(
-        "0: системный индекс",
-        "1: шаги как у кнопок и панель Sony",
-        "2: шаги через сессию плеера",
-        "3: громкость Sony (izm_master_volume)"
-    )
 
     private var coverSquare: Bitmap? = null
     private var hdrArtistShown = ""
@@ -274,23 +257,53 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // ------------------------------------------------------------------
     private var lastFrameTime = 0L
     private var frameLoopRunning = false
+    private var spinK = 0f            // 0..1: разгон и торможение диска
+    private var flipAngle = 0f        // дополнительный оборот при смене трека
+    private var flipAnimator: ValueAnimator? = null
+    private var trackKey = ""
 
     private val frameRunnable = object : Runnable {
         override fun run() {
             val now = SystemClock.uptimeMillis()
             val dt = now - lastFrameTime
             lastFrameTime = now
-            if (isPlaying && !scrubbing && !listSeeking) {
-                discAngle = (discAngle + dt * Design.DISC_DEG_PER_MS) % 360f
-                currentPositionMs = (currentPositionMs + dt).coerceIn(0L, maxPosition())
+
+            val goal = if (isPlaying) 1f else 0f
+            val stepK = dt / Design.DISC_RAMP_MS
+            spinK = if (spinK < goal) min(goal, spinK + stepK) else maxOf(goal, spinK - stepK)
+
+            if (!scrubbing && !listSeeking) {
+                val speed = spinK * spinK * (3f - 2f * spinK)
+                discAngle = (discAngle + dt * Design.DISC_DEG_PER_MS * speed) % 360f
+                if (isPlaying) currentPositionMs = (currentPositionMs + dt).coerceIn(0L, maxPosition())
             }
             invalidate()
-            if (isPlaying) {
+            if (isPlaying || spinK > 0f) {
                 postOnAnimation(this)
             } else {
                 frameLoopRunning = false
             }
         }
+    }
+
+    // Быстрый оборот диска: dir = 1 по часовой стрелке, -1 против
+    private fun startFlip(dir: Int) {
+        if (flipAnimator?.isRunning == true) return
+        val a = ValueAnimator.ofFloat(0f, 360f * dir)
+        a.duration = Design.DISC_FLIP_MS
+        a.interpolator = AccelerateDecelerateInterpolator()
+        a.addUpdateListener {
+            flipAngle = it.animatedValue as Float
+            invalidate()
+        }
+        a.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                flipAngle = 0f
+                invalidate()
+            }
+        })
+        flipAnimator = a
+        a.start()
     }
 
     private fun ensureFrameLoop() {
@@ -305,7 +318,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private val housekeeping = object : Runnable {
         override fun run() {
             if (mode != Mode.VOLUME) {
-                if (volMethod == 3 && housekeepingTick % 3 == 0) pollIzmVolume()
+                if (housekeepingTick % 3 == 0) pollIzmVolume()
                 syncVolumeFromSystem()
             }
             housekeepingTick++
@@ -383,6 +396,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
         WalkmanNotificationListener.onStateChanged = null
         WalkmanNotificationListener.onQueueChanged = null
         sheetAnimator?.cancel()
+        sheetXAnimator?.cancel()
+        flipAnimator?.cancel()
         loadGeneration++
         stepTarget = null
         mainHandler.removeCallbacks(stepRunnable)
@@ -418,23 +433,12 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
     }
 
+    // Шкала показывает громкость Sony, если её уровень известен
     private fun syncVolumeFromSystem() {
-        if (volMethod == 3) {
-            // Шкала показывает громкость Sony, если её уровень известен
-            if (izmCur >= 0 && mode != Mode.VOLUME) {
-                val p = (izmCur * 100f / Design.IZM_MAX).roundToInt().coerceIn(0, 100)
-                if (p != volumePercent) {
-                    volumePercent = p
-                    invalidate()
-                }
-            }
-            return
-        }
-        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        val pct = if (max > 0) (cur * 100f / max).roundToInt() else 0
-        if (pct != volumePercent) {
-            volumePercent = pct
+        if (izmCur < 0 || mode == Mode.VOLUME) return
+        val p = (izmCur * 100f / Design.IZM_MAX).roundToInt().coerceIn(0, 100)
+        if (p != volumePercent) {
+            volumePercent = p
             invalidate()
         }
     }
@@ -454,13 +458,19 @@ class WalkmanRemoteView(context: Context) : View(context) {
         val usableRaw = raw?.takeIf { !looksLikePlaceholder(it) }
         coverBitmap = usableRaw?.let { makeCover(it) }
         coverSquare = usableRaw?.let { makeSquareCover(it) }
-        if (raw == null) lastCoverInfo = "Обложки нет в метаданных"
 
         titleShown = fit(songTitle, flexPaint, Design.TEXT_MAX_W)
         artistShown = fit(artistName, flexPaint, Design.TEXT_MAX_W)
 
         currentAlbum = meta.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
-        currentTrackNo = meta.getLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER).toInt()
+        val newNo = meta.getLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER).toInt()
+        val key = "$songTitle|$artistName|$newNo"
+        // Трек сменился не по нашей команде (кнопки плеера, конец песни): оборот диска
+        if (trackKey.isNotEmpty() && key != trackKey && stepTarget == null) {
+            startFlip(if (newNo in 1 until currentTrackNo) -1 else 1)
+        }
+        trackKey = key
+        currentTrackNo = newNo
         rebuildTracks()
         refreshHeader(meta)
 
@@ -513,7 +523,6 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
     // Плеер Sony для альбомов без обложки отдаёт свою серую картинку с нотой.
     // Узнаём её по виду: почти нет цвета и небольшой контраст.
-    private var lastCoverInfo = "Данных об обложке пока нет"
 
     private fun looksLikePlaceholder(bmp: Bitmap): Boolean {
         return try {
@@ -534,10 +543,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
             lums.sort()
             val chroma = chromaSum / (n * n)
             val range = lums[(n * n * 0.95).toInt()] - lums[(n * n * 0.05).toInt()]
-            val hidden = chroma < Design.PLACEHOLDER_MAX_CHROMA && range < Design.PLACEHOLDER_MAX_RANGE
-            lastCoverInfo = "Обложка ${bmp.width}x${bmp.height}, цвет $chroma (порог ${Design.PLACEHOLDER_MAX_CHROMA}), " +
-                "контраст $range (порог ${Design.PLACEHOLDER_MAX_RANGE}), " + if (hidden) "скрыта как заглушка" else "показана"
-            hidden
+            chroma < Design.PLACEHOLDER_MAX_CHROMA && range < Design.PLACEHOLDER_MAX_RANGE
         } catch (e: Exception) {
             false
         }
@@ -592,13 +598,18 @@ class WalkmanRemoteView(context: Context) : View(context) {
         updateTimeStrings()
 
         // Когда список закрывает весь экран, главный экран под ним не рисуем
-        if (!(sheetVisible && sheetY <= 0f)) {
+        if (!(sheetVisible && sheetY <= 0f && sheetX <= 0f)) {
             drawTopRow(canvas)
             drawDisc(canvas)
             drawTitleRow(canvas)
             drawVolume(canvas)
         }
-        if (sheetVisible) drawSheet(canvas)
+        if (sheetVisible) {
+            drawSheet(canvas)
+            // Верхняя строка одна на оба экрана и всегда на месте
+            canvas.drawRect(0f, 0f, Design.W, Design.TOP_H, blackPaint)
+            drawTopRow(canvas)
+        }
 
         canvas.restore()
     }
@@ -652,7 +663,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
         // Вращающаяся часть: две линии и обложка
         canvas.save()
-        canvas.rotate(discAngle, cx, cy)
+        canvas.rotate(discAngle + flipAngle, cx, cy)
         canvas.drawLine(cx - r, cy, cx + r, cy, linePaint)
         // Вторая линия только внутри внутреннего круга (так на макете)
         canvas.drawLine(cx, cy - Design.COVER_R, cx, cy + Design.COVER_R, linePaint)
@@ -760,7 +771,6 @@ class WalkmanRemoteView(context: Context) : View(context) {
         // Круглая кнопка "C"
         if (hypot(x - Design.C_CX, y - Design.C_CY) <= Design.C_R + 4f) {
             mode = Mode.COLOR
-            colorDownTime = SystemClock.uptimeMillis()
             return
         }
 
@@ -800,13 +810,9 @@ class WalkmanRemoteView(context: Context) : View(context) {
             mode = Mode.VOLUME
             volStartProgress = volumeProgress(x, y)
             // Уровень Sony пока неизвестен: считаем от нуля (так громче, чем было, не станет)
-            if (volMethod == 3 && izmCur < 0) volumePercent = 0
+            if (izmCur < 0) volumePercent = 0
             izmLastSent = -1
             volStartPercent = volumePercent
-            lastSentVolume = -1
-            toastShownForThisDrag = false
-            volDownTime = SystemClock.uptimeMillis()
-            volMoved = false
         }
     }
 
@@ -834,12 +840,11 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
             Mode.VOLUME -> {
                 val p = volumeProgress(x, y)
-                if (abs(p - volStartProgress) > 0.01f) volMoved = true
                 val target = (volStartPercent + (p - volStartProgress) * 100f * Design.VOLUME_GAIN)
                     .coerceIn(0f, 100f).roundToInt()
                 if (target != volumePercent) {
                     volumePercent = target
-                    setSystemVolume(target)
+                    setIzmVolume(target)
                     invalidate()
                 }
             }
@@ -868,17 +873,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 if (!cancelled && !longPressed) {
                     val tc = WalkmanNotificationListener.activeController?.transportControls
                     if (mode == Mode.PREV) tc?.skipToPrevious() else tc?.skipToNext()
+                    startFlip(if (mode == Mode.PREV) -1 else 1)
                 }
-            }
-
-            Mode.VOLUME -> {
-                // Долгое удержание без движения: показать сведения о громкости (для настройки)
-                if (!volMoved && !cancelled &&
-                    SystemClock.uptimeMillis() - volDownTime >= Design.CLONG_PRESS_MS
-                ) {
-                    showVolumeDialog()
-                }
-                finishVolumeDrag()
             }
 
             Mode.TITLE -> {
@@ -887,12 +883,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
             Mode.COLOR -> {
                 if (!cancelled && hypot(x - Design.C_CX, y - Design.C_CY) <= Design.C_R + 12f) {
-                    if (SystemClock.uptimeMillis() - colorDownTime >= Design.CLONG_PRESS_MS) {
-                        // Долгое нажатие: показать данные об обложке (для настройки)
-                        showInfo("Диагностика", lastCoverInfo + "\n\n" + queueInfo())
-                    } else {
-                        showColorPickerDialog()
-                    }
+                    showColorPickerDialog()
                 }
             }
 
@@ -939,96 +930,53 @@ class WalkmanRemoteView(context: Context) : View(context) {
     }
 
     // ------------------------------------------------------------------
-    // Громкость
+    // Громкость: плеер Sony регулирует звук параметром izm_master_volume
     // ------------------------------------------------------------------
-    private fun setSystemVolume(percent: Int) {
-        if (volMethod == 3) {
-            setIzmVolume(percent)
-            return
-        }
-        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        val target = (percent * max / 100f).roundToInt()
-        if (target == lastSentVolume) return
-        lastSentVolume = target
-        if (volMethod != 0) {
-            stepSystemVolume(target, volMethod == 2)
-            return
-        }
-        try {
-            val flags = if (Design.VOLUME_SHOW_PANEL) AudioManager.FLAG_SHOW_UI else 0
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, flags)
-        } catch (e: Exception) {
-        }
-
-        // Если сессия плеера использует собственную громкость, передаём значение и ей
-        try {
-            val ctrl = WalkmanNotificationListener.activeController
-            val info = ctrl?.playbackInfo
-            if (ctrl != null && info != null &&
-                info.playbackType == MediaController.PlaybackInfo.PLAYBACK_TYPE_REMOTE &&
-                info.maxVolume > 0
-            ) {
-                ctrl.setVolumeTo((percent * info.maxVolume / 100f).roundToInt(), 0)
-            }
-        } catch (e: Exception) {
-        }
-    }
-
-    // ---- Громкость Sony: параметр izm_master_volume в аудио-железе ----
     private var izmCur = -1                 // текущий уровень, -1 = пока неизвестен
     private var izmLastSent = -1
     private var izmGetWorks = true
     private var izmGetFails = 0
-    private var izmGetResult = ""
-    private var izmLastEvent = "пока нет (нажмите кнопку громкости на плеере)"
 
+    // Кнопки громкости на корпусе: плеер присылает новый уровень, двигаем шкалу
     private val izmReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
             intent ?: return
-            val act = intent.action ?: ""
-            val sb = StringBuilder(act.substringAfterLast('.'))
-            try {
-                val ex = intent.extras
-                if (ex != null) {
-                    var candidate = -1
-                    for (k in ex.keySet()) {
-                        @Suppress("DEPRECATION")
-                        val v = ex.get(k)
-                        sb.append(' ').append(k).append('=').append(v)
-                        val num: Int? = when (v) {
-                            is Int -> v
-                            is Long -> v.toInt()
-                            else -> null
-                        }
-                        if (num != null && candidate < 0 &&
-                            (k.contains("volume", true) || k.contains("level", true) || k.contains("value", true))
-                        ) {
-                            candidate = num
+            if (intent.action?.endsWith("MASTER_VOLUME_CHANGED") == true) {
+                try {
+                    val ex = intent.extras
+                    if (ex != null) {
+                        for (k in ex.keySet()) {
+                            if (!(k.contains("volume", true) || k.contains("level", true) || k.contains("value", true))) continue
+                            @Suppress("DEPRECATION")
+                            val v = ex.get(k)
+                            val num: Int? = when (v) {
+                                is Int -> v
+                                is Long -> v.toInt()
+                                else -> null
+                            }
+                            if (num != null && num >= 0) {
+                                izmCur = num.coerceIn(0, Design.IZM_MAX)
+                                break
+                            }
                         }
                     }
-                    if (candidate >= 0 && act.endsWith("MASTER_VOLUME_CHANGED")) {
-                        izmCur = candidate.coerceIn(0, Design.IZM_MAX)
-                    }
+                } catch (e: Exception) {
                 }
-            } catch (e: Exception) {
             }
-            izmLastEvent = sb.toString()
             syncVolumeFromSystem()
         }
     }
 
     // Читаем текущий уровень у аудио-железа (если оно отвечает на такой запрос)
-    private fun pollIzmVolume(force: Boolean = false) {
-        if (!izmGetWorks && !force) return
+    private fun pollIzmVolume() {
+        if (!izmGetWorks) return
         try {
             val r = audioManager.getParameters("izm_master_volume") ?: ""
-            izmGetResult = r
             val v = r.substringAfter("izm_master_volume=", "").takeWhile { it.isDigit() }.toIntOrNull()
             if (v != null) {
                 izmCur = v.coerceIn(0, Design.IZM_MAX)
                 izmGetFails = 0
-                izmGetWorks = true
-            } else if (++izmGetFails >= 3 && !force) {
+            } else if (++izmGetFails >= 3) {
                 izmGetWorks = false
             }
         } catch (e: Exception) {
@@ -1045,172 +993,6 @@ class WalkmanRemoteView(context: Context) : View(context) {
             izmCur = v
         } catch (e: Exception) {
         }
-    }
-
-    // Громкость шагами, как это делают физические кнопки
-    private fun stepSystemVolume(target: Int, viaSession: Boolean) {
-        try {
-            val ctrl = WalkmanNotificationListener.activeController
-            var cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            var guard = 0
-            while (cur != target && guard++ < 40) {
-                val dir = if (cur < target) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
-                if (viaSession && ctrl != null) {
-                    ctrl.adjustVolume(dir, 0)
-                } else {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, AudioManager.FLAG_SHOW_UI)
-                }
-                val next = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                if (next == cur) break
-                cur = next
-            }
-        } catch (e: Exception) {
-        }
-    }
-
-    // Окно "Громкость": сведения и переключение способа управления
-    private fun showVolumeDialog() {
-        pollIzmVolume(true)
-        try {
-            AlertDialog.Builder(context)
-                .setTitle("Громкость")
-                .setMessage(volumeDiagnostics())
-                .setPositiveButton("Следующий способ") { _, _ ->
-                    volMethod = (volMethod + 1) % volMethodNames.size
-                    prefs.edit().putInt("vol_method", volMethod).apply()
-                    Toast.makeText(context, "Способ " + volMethodNames[volMethod], Toast.LENGTH_LONG).show()
-                }
-                .setNegativeButton("Закрыть", null)
-                .show()
-        } catch (e: Exception) {
-            Toast.makeText(context, volumeDiagnostics(), Toast.LENGTH_LONG).show()
-        }
-    }
-
-    // Сведения о громкости для настройки (долгое удержание пальца на полукруге)
-    private fun volumeDiagnostics(): String {
-        val sb = StringBuilder()
-        sb.append("Способ ").append(volMethodNames[volMethod]).append("\n")
-        sb.append("Sony: уровень ").append(if (izmCur >= 0) "$izmCur из ${Design.IZM_MAX}" else "неизвестен")
-            .append(", чтение: ").append(if (izmGetResult.isBlank()) "нет ответа" else izmGetResult)
-            .append("\nСобытие Sony: ").append(izmLastEvent).append("\n")
-        try {
-            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            sb.append("Громкость: $cur из $max")
-        } catch (e: Exception) {
-        }
-        try {
-            sb.append(", фиксированная: ").append(audioManager.isVolumeFixed)
-        } catch (e: Exception) {
-        }
-        try {
-            val devs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                .joinToString(", ") { deviceName(it.type) }
-            sb.append("\nВыходы (типы): ").append(devs)
-        } catch (e: Exception) {
-        }
-        try {
-            val info = WalkmanNotificationListener.activeController?.playbackInfo
-            if (info != null) {
-                if (info.playbackType == MediaController.PlaybackInfo.PLAYBACK_TYPE_REMOTE) {
-                    sb.append("\nСессия плеера: своя громкость ${info.currentVolume} из ${info.maxVolume}")
-                } else {
-                    sb.append("\nСессия плеера: системная громкость")
-                }
-            }
-        } catch (e: Exception) {
-        }
-        // Как система переводит индексы громкости в децибелы для этих наушников
-        try {
-            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val outs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            val dev = outs.firstOrNull {
-                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES || it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET
-            } ?: outs.firstOrNull()
-            if (dev != null) {
-                val pts = intArrayOf(0, max / 2, max)
-                val s = pts.joinToString("  ") { i ->
-                    String.format(Locale.US, "%d:%.0f", i, audioManager.getStreamVolumeDb(AudioManager.STREAM_MUSIC, i, dev.type))
-                }
-                sb.append("\nдБ (индекс:дБ): ").append(s)
-            }
-        } catch (e: Exception) {
-        }
-        return sb.toString()
-    }
-
-    private fun deviceName(t: Int): String = when (t) {
-        2 -> "speaker"
-        3 -> "wired_headset"
-        4 -> "wired_headphones"
-        7 -> "bt_sco"
-        8 -> "bt_a2dp"
-        11 -> "usb_device"
-        22 -> "usb_headset"
-        else -> "type$t"
-    }
-
-    private fun actionsInfo(a: Long): String {
-        val all = listOf(
-            PlaybackState.ACTION_PLAY to "play",
-            PlaybackState.ACTION_PAUSE to "pause",
-            PlaybackState.ACTION_SKIP_TO_NEXT to "next",
-            PlaybackState.ACTION_SKIP_TO_PREVIOUS to "prev",
-            PlaybackState.ACTION_SEEK_TO to "seek",
-            PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM to "queue_item",
-            PlaybackState.ACTION_PLAY_FROM_URI to "play_from_uri",
-            PlaybackState.ACTION_PLAY_FROM_MEDIA_ID to "play_from_id"
-        )
-        return all.filter { (a and it.first) != 0L }.joinToString(", ") { it.second }
-    }
-
-    private fun queueInfo(): String {
-        val sb = StringBuilder()
-        try {
-            val ctrl = WalkmanNotificationListener.activeController
-            sb.append("Источник списка: ").append(trackSource)
-            sb.append("\nОчередь плеера: ").append(ctrl?.queue?.size ?: 0).append(" треков")
-            sb.append("\nДоступ к музыке: ").append(if (hasAudioPermission()) "есть" else "нет")
-            sb.append("\nАльбом: ").append(if (currentAlbum.isBlank()) "(не передан)" else currentAlbum)
-            sb.append("\nСессия: ").append(ctrl?.packageName ?: "нет")
-            sb.append("\nКоманды плеера: ").append(actionsInfo(ctrl?.playbackState?.actions ?: 0L))
-        } catch (e: Exception) {
-            sb.append("Данные недоступны")
-        }
-        return sb.toString()
-    }
-
-    // В конце движения проверяем, что система приняла громкость.
-    // Если нет, пробуем подвинуть шагами, как это делают физические кнопки.
-    private fun finishVolumeDrag() {
-        if (lastSentVolume < 0) return
-        val target = lastSentVolume
-        try {
-            var cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            var guard = 0
-            while (cur != target && guard++ < 200) {
-                audioManager.adjustStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    if (cur < target) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
-                    0
-                )
-                val next = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                if (next == cur) break
-                cur = next
-            }
-            if (cur != target && !toastShownForThisDrag) {
-                toastShownForThisDrag = true
-                val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                Toast.makeText(
-                    context,
-                    "Громкость не применилась: нужно $target, в системе $cur из $max",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        } catch (e: Exception) {
-        }
-        syncVolumeFromSystem()
     }
 
     // ------------------------------------------------------------------
@@ -1244,17 +1026,13 @@ class WalkmanRemoteView(context: Context) : View(context) {
             null
         }
         var list = TrackLoader.fromQueue(q)
-        if (list.size > 1) {
-            trackSource = "очередь плеера (" + list.size + ")"
-        } else {
+        if (list.size <= 1) {
             val key = albumKeyNow()
             if (key != null && key == albumKey && albumTracks.isNotEmpty()) {
                 list = albumTracks
-                trackSource = "альбом из библиотеки (" + list.size + ")"
             } else {
                 // Крайний случай: хотя бы играющий трек
                 list = listOf(TrackItem(-1L, songTitle, null, trackDurationMs))
-                trackSource = "только играющий трек"
                 loadAlbumAsync()
             }
         }
@@ -1308,18 +1086,6 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 rebuildTracks()
             }
         }.start()
-    }
-
-    private fun showInfo(title: String, text: String) {
-        try {
-            AlertDialog.Builder(context)
-                .setTitle(title)
-                .setMessage(text)
-                .setPositiveButton("OK", null)
-                .show()
-        } catch (e: Exception) {
-            Toast.makeText(context, text, Toast.LENGTH_LONG).show()
-        }
     }
 
     private fun refreshHeader(meta: MediaMetadata) {
@@ -1442,6 +1208,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
         sheetVisible = true
         sheetY = Design.H
+        sheetX = 0f
         animateSheet(0f, Design.SHEET_OPEN_MS, null)
     }
 
@@ -1451,6 +1218,40 @@ class WalkmanRemoteView(context: Context) : View(context) {
             listFlingV = 0f
             invalidate()
         }
+    }
+
+    // Закрытие смахиванием вправо
+    private fun closeSheetSide() {
+        animateSheetX(Design.W, Design.SHEET_CLOSE_MS) {
+            sheetVisible = false
+            sheetX = 0f
+            listFlingV = 0f
+            invalidate()
+        }
+    }
+
+    private fun animateSheetX(to: Float, durationMs: Long, endAction: (() -> Unit)?) {
+        sheetXAnimator?.cancel()
+        val a = ValueAnimator.ofFloat(sheetX, to)
+        a.duration = durationMs
+        a.interpolator = DecelerateInterpolator()
+        a.addUpdateListener {
+            sheetX = it.animatedValue as Float
+            invalidate()
+        }
+        a.addListener(object : AnimatorListenerAdapter() {
+            private var cancelled = false
+
+            override fun onAnimationCancel(animation: Animator) {
+                cancelled = true
+            }
+
+            override fun onAnimationEnd(animation: Animator) {
+                if (!cancelled) endAction?.invoke()
+            }
+        })
+        sheetXAnimator = a
+        a.start()
     }
 
     private fun animateSheet(to: Float, durationMs: Long, endAction: (() -> Unit)?) {
@@ -1482,20 +1283,16 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // ------------------------------------------------------------------
     private fun drawSheet(canvas: Canvas) {
         canvas.save()
-        canvas.translate(0f, sheetY)
+        canvas.translate(sheetX, sheetY)
         canvas.drawRect(0f, 0f, Design.W, Design.H, blackPaint)
 
-        // Прокручиваемая часть: шапка и строки с песнями
+        // Шапка и строки с песнями (верхнюю строку B / M / SD рисует onDraw поверх)
         canvas.save()
-        canvas.clipRect(0f, Design.TOP_H, Design.W, Design.H)
+        canvas.clipRect(0f, 0f, Design.W, Design.H)
         canvas.translate(0f, -listScroll)
         drawSheetHeader(canvas)
         drawSheetRows(canvas)
         canvas.restore()
-
-        // Верхняя строка B / M / SD всегда на месте
-        canvas.drawRect(0f, 0f, Design.W, Design.TOP_H, blackPaint)
-        drawTopRow(canvas)
 
         canvas.restore()
     }
@@ -1537,7 +1334,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         if (list.isEmpty()) return
 
         val base0 = Design.SHEET_HEADER_BOTTOM
-        val visTop = listScroll + Design.TOP_H
+        val visTop = listScroll
         val visBottom = listScroll + Design.H
         val first = maxOf(0, ((visTop - base0) / Design.ROW_H).toInt())
         val last = minOf(list.size - 1, ((visBottom - base0) / Design.ROW_H).toInt())
@@ -1593,6 +1390,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (sheetAnimator?.isRunning == true) sheetAnimator?.cancel()
+                if (sheetXAnimator?.isRunning == true) sheetXAnimator?.cancel()
                 removeCallbacks(flingRunnable)
                 listFlingV = 0f
                 sg = SheetGesture.PENDING
@@ -1614,6 +1412,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 if (sg == SheetGesture.PENDING && hypot(dx, dy) > touchSlop) {
                     sg = when {
                         sgOnActive && abs(dx) > abs(dy) -> SheetGesture.SEEK
+                        abs(dx) > abs(dy) && dx > 0f -> SheetGesture.DRAG_SIDE
                         abs(dy) >= abs(dx) && sgAtTop && dy > 0f -> SheetGesture.DRAG_SHEET
                         abs(dy) >= abs(dx) -> SheetGesture.SCROLL
                         else -> SheetGesture.IGNORE
@@ -1633,6 +1432,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
                         if (sheetY <= 0f && step < 0f) sg = SheetGesture.SCROLL
                     }
 
+                    SheetGesture.DRAG_SIDE -> sheetX = (x - sgDownX).coerceAtLeast(0f)
+
                     SheetGesture.SEEK -> seekPreview(x)
 
                     else -> {
@@ -1647,6 +1448,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 velocity?.addMovement(event)
                 velocity?.computeCurrentVelocity(1000)
                 val vy = (velocity?.yVelocity ?: 0f) * Design.H / height
+                val vx = (velocity?.xVelocity ?: 0f) * Design.W / width
                 velocity?.recycle()
                 velocity = null
 
@@ -1660,6 +1462,16 @@ class WalkmanRemoteView(context: Context) : View(context) {
                     }
 
                     SheetGesture.SCROLL -> startFling(-vy)
+
+                    SheetGesture.DRAG_SIDE -> {
+                        val far = sheetX > Design.W * Design.SHEET_SIDE_FRACTION
+                        val fast = vx > Design.SHEET_SIDE_VELOCITY
+                        if (!cancelled && (far || fast)) {
+                            closeSheetSide()
+                        } else {
+                            animateSheetX(0f, 180L, null)
+                        }
+                    }
 
                     SheetGesture.DRAG_SHEET -> {
                         val far = sheetY > Design.H * Design.SHEET_DISMISS_FRACTION
@@ -1677,10 +1489,15 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
                 listSeeking = false
                 // Если экран остановился не в крайнем положении, возвращаем его на место
-                if (sg != SheetGesture.DRAG_SHEET && sheetY > 0f && sheetVisible &&
+                if (sg != SheetGesture.DRAG_SHEET && sg != SheetGesture.DRAG_SIDE && sheetY > 0f && sheetVisible &&
                     sheetAnimator?.isRunning != true
                 ) {
                     animateSheet(0f, 150L, null)
+                }
+                if (sg != SheetGesture.DRAG_SIDE && sheetX > 0f && sheetVisible &&
+                    sheetXAnimator?.isRunning != true
+                ) {
+                    animateSheetX(0f, 150L, null)
                 }
                 sg = SheetGesture.NONE
                 invalidate()
@@ -1730,87 +1547,108 @@ class WalkmanRemoteView(context: Context) : View(context) {
             return
         }
 
-        // Очереди нет: листаем кнопками "вперёд" и "назад" (порядок как в альбоме),
-        // потом проверяем, что включилась нужная песня
+        // Очереди нет: листаем кнопками "вперёд" и "назад" (порядок как в альбоме)
         val from = activeIndex()
         if (from >= 0 && from != index) {
-            stepToTrack(item)
-        } else if (from < 0) {
-            playByUri(item)
+            startFlip(if (index > from) 1 else -1)
+            stepToTrack(index, from)
         }
     }
 
-    private fun playByUri(item: TrackItem) {
-        val ctrl = WalkmanNotificationListener.activeController ?: return
-        val uri = item.uri ?: return
-        val actions = ctrl.playbackState?.actions ?: 0L
-        if ((actions and PlaybackState.ACTION_PLAY_FROM_URI) != 0L) {
-            ctrl.transportControls.playFromUri(uri, Bundle())
-        }
-    }
-
-    // Переход на выбранную песню шагами "вперёд/назад". После каждого шага смотрим,
-    // какая песня играет на самом деле, и только потом делаем следующий.
+    // Переход на выбранную песню. У плеера Sony есть только "вперёд" и "назад", поэтому
+    // команды идут сериями с опережением (не ждём каждого переключения), а в конце
+    // проверяем результат и при необходимости досылаем недостающие шаги.
     private var stepTarget: TrackItem? = null
-    private var stepIdxAtIssue = -2
-    private var stepIssuedAt = 0L
-    private var stepCount = 0
+    private var stepDir = 1
+    private var stepStartIdx = 0
+    private var stepNeeded = 0
+    private var stepRestart = 0
+    private var stepIssued = 0
+    private var stepPlans = 0
+    private var stepLastIssueAt = 0L
+    private var stepLastChangeAt = 0L
+    private var stepLastCur = -1
+
+    private fun planSteps(cur: Int, targetIdx: Int) {
+        stepStartIdx = cur
+        stepDir = if (targetIdx > cur) 1 else -1
+        // "Назад" на середине песни только начинает её заново: нужен лишний шаг
+        stepRestart = if (stepDir < 0 && currentPositionMs > Design.PREV_RESTART_MS) 1 else 0
+        stepNeeded = abs(targetIdx - cur) + stepRestart
+        stepIssued = 0
+        stepLastChangeAt = SystemClock.uptimeMillis()
+        stepPlans++
+    }
 
     private val stepRunnable = object : Runnable {
         override fun run() {
             val target = stepTarget ?: return
-            if (!isAttachedToWindow) {
+            val tc = WalkmanNotificationListener.activeController?.transportControls
+            if (!isAttachedToWindow || tc == null) {
                 stepTarget = null
                 return
             }
             val targetIdx = tracks.indexOfFirst { it.title == target.title && it.trackNo == target.trackNo }
             val cur = activeIndex()
-            if (targetIdx < 0 || cur < 0 || cur == targetIdx || stepCount >= 80) {
-                finishStepping(target)
+            if (targetIdx < 0 || cur < 0) {
+                stepTarget = null
                 return
             }
-            // После шага номер песни должен сдвинуться ровно на 1. Иначе это shuffle или сбой.
-            if (stepIdxAtIssue >= 0 && cur != stepIdxAtIssue && abs(cur - stepIdxAtIssue) != 1) {
-                Toast.makeText(context, "Порядок треков не совпал. Выключен ли shuffle в плеере?", Toast.LENGTH_LONG).show()
-                finishStepping(null)
-                return
-            }
-            // Ждём, пока плеер переключится после прошлого шага (но не дольше 1,2 секунды:
-            // кнопка "назад" может просто начать текущую песню заново)
-            val waiting = cur == stepIdxAtIssue && SystemClock.uptimeMillis() - stepIssuedAt < 1200L
-            if (!waiting) {
-                val tc = WalkmanNotificationListener.activeController?.transportControls
-                if (tc == null) {
-                    finishStepping(null)
+            val now = SystemClock.uptimeMillis()
+
+            if (cur != stepLastCur) {
+                // Индекс скакнул дальше, чем мы успели отправить команд: включён shuffle
+                if (stepLastCur >= 0 && abs(cur - stepLastCur) > Design.STEP_LOOKAHEAD) {
+                    Toast.makeText(context, "Порядок треков не совпал. Выключен ли shuffle в плеере?", Toast.LENGTH_LONG).show()
+                    stepTarget = null
                     return
                 }
-                if (targetIdx > cur) tc.skipToNext() else tc.skipToPrevious()
-                stepIdxAtIssue = cur
-                stepIssuedAt = SystemClock.uptimeMillis()
-                stepCount++
+                stepLastCur = cur
+                stepLastChangeAt = now
             }
-            mainHandler.postDelayed(this, 120L)
+            if (cur == targetIdx) {
+                stepTarget = null
+                return
+            }
+
+            var progress = (cur - stepStartIdx) * stepDir
+            var inFlight = (stepIssued - progress - stepRestart).coerceAtLeast(0)
+            val lookahead = if (stepPlans > 1) 1 else Design.STEP_LOOKAHEAD
+            val passed = (targetIdx - cur) * stepDir < 0
+            val stalled = now - stepLastChangeAt > Design.STEP_STALL_MS &&
+                (stepIssued >= stepNeeded || inFlight >= lookahead)
+            if (passed || stalled) {
+                // Перелетели или плеер пропустил команду: считаем путь заново от текущей песни
+                if (stepPlans >= 5) {
+                    stepTarget = null
+                    return
+                }
+                planSteps(cur, targetIdx)
+                progress = 0
+                inFlight = 0
+            }
+
+            val lookNow = if (stepPlans > 1) 1 else lookahead
+            if (stepIssued < stepNeeded && inFlight < lookNow &&
+                now - stepLastIssueAt >= Design.STEP_GAP_MS
+            ) {
+                if (stepDir > 0) tc.skipToNext() else tc.skipToPrevious()
+                stepIssued++
+                stepLastIssueAt = now
+            }
+            mainHandler.postDelayed(this, Design.STEP_TICK_MS)
         }
     }
 
-    private fun stepToTrack(target: TrackItem) {
-        stepTarget = target
-        stepIdxAtIssue = -2
-        stepCount = 0
+    private fun stepToTrack(targetIdx: Int, from: Int) {
+        val item = tracks.getOrNull(targetIdx) ?: return
+        stepTarget = item
+        stepLastCur = from
+        stepPlans = 0
+        stepLastIssueAt = 0L
+        planSteps(from, targetIdx)
         mainHandler.removeCallbacks(stepRunnable)
         stepRunnable.run()
-    }
-
-    private fun finishStepping(verify: TrackItem?) {
-        stepTarget = null
-        mainHandler.removeCallbacks(stepRunnable)
-        if (verify != null) mainHandler.postDelayed({ verifyLanded(verify) }, 900L)
-    }
-
-    // Если после перелистывания играет не та песня, пробуем включить её по адресу файла
-    private fun verifyLanded(target: TrackItem) {
-        if (songTitle.trim().equals(target.title.trim(), ignoreCase = true)) return
-        playByUri(target)
     }
 
     // ------------------------------------------------------------------

@@ -220,11 +220,12 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
     // Способ управления громкостью. Меняется в окне "Громкость":
     // подержите палец на полукруге около секунды, не двигая.
-    private var volMethod = prefs.getInt("vol_method", 0)
+    private var volMethod = prefs.getInt("vol_method", 3)
     private val volMethodNames = arrayOf(
         "0: системный индекс",
         "1: шаги как у кнопок и панель Sony",
-        "2: шаги через сессию плеера"
+        "2: шаги через сессию плеера",
+        "3: громкость Sony (izm_master_volume)"
     )
 
     private var coverSquare: Bitmap? = null
@@ -303,7 +304,10 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var housekeepingTick = 0
     private val housekeeping = object : Runnable {
         override fun run() {
-            if (mode != Mode.VOLUME) syncVolumeFromSystem()
+            if (mode != Mode.VOLUME) {
+                if (volMethod == 3 && housekeepingTick % 3 == 0) pollIzmVolume()
+                syncVolumeFromSystem()
+            }
             housekeepingTick++
             if (housekeepingTick % 100 == 0) {
                 updateStorageStats()
@@ -338,6 +342,15 @@ class WalkmanRemoteView(context: Context) : View(context) {
         } catch (e: Exception) {
         }
 
+        // События громкости Sony (кнопки на плеере): двигаем шкалу вслед за ними
+        try {
+            val f = IntentFilter()
+            f.addAction("com.sony.walkman.intent.action.MASTER_VOLUME_CHANGED")
+            f.addAction("com.sony.walkman.intent.action.VOLUME_KEY_PRESSED")
+            context.registerReceiver(izmReceiver, f)
+        } catch (e: Exception) {
+        }
+
         updateStorageStats()
         syncVolumeFromSystem()
 
@@ -362,11 +375,17 @@ class WalkmanRemoteView(context: Context) : View(context) {
             context.unregisterReceiver(batteryReceiver)
         } catch (e: Exception) {
         }
+        try {
+            context.unregisterReceiver(izmReceiver)
+        } catch (e: Exception) {
+        }
         WalkmanNotificationListener.onMetadataChanged = null
         WalkmanNotificationListener.onStateChanged = null
         WalkmanNotificationListener.onQueueChanged = null
         sheetAnimator?.cancel()
         loadGeneration++
+        stepTarget = null
+        mainHandler.removeCallbacks(stepRunnable)
         removeCallbacks(flingRunnable)
         removeCallbacks(housekeeping)
         removeCallbacks(frameRunnable)
@@ -400,6 +419,17 @@ class WalkmanRemoteView(context: Context) : View(context) {
     }
 
     private fun syncVolumeFromSystem() {
+        if (volMethod == 3) {
+            // Шкала показывает громкость Sony, если её уровень известен
+            if (izmCur >= 0 && mode != Mode.VOLUME) {
+                val p = (izmCur * 100f / Design.IZM_MAX).roundToInt().coerceIn(0, 100)
+                if (p != volumePercent) {
+                    volumePercent = p
+                    invalidate()
+                }
+            }
+            return
+        }
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
         val pct = if (max > 0) (cur * 100f / max).roundToInt() else 0
@@ -769,6 +799,9 @@ class WalkmanRemoteView(context: Context) : View(context) {
         if (y > Design.TITLE_BOTTOM && hypot(x - Design.VOL_CX, y - Design.VOL_CY) <= Design.VOL_R + 1f) {
             mode = Mode.VOLUME
             volStartProgress = volumeProgress(x, y)
+            // Уровень Sony пока неизвестен: считаем от нуля (так громче, чем было, не станет)
+            if (volMethod == 3 && izmCur < 0) volumePercent = 0
+            izmLastSent = -1
             volStartPercent = volumePercent
             lastSentVolume = -1
             toastShownForThisDrag = false
@@ -909,6 +942,10 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // Громкость
     // ------------------------------------------------------------------
     private fun setSystemVolume(percent: Int) {
+        if (volMethod == 3) {
+            setIzmVolume(percent)
+            return
+        }
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val target = (percent * max / 100f).roundToInt()
         if (target == lastSentVolume) return
@@ -937,6 +974,79 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
     }
 
+    // ---- Громкость Sony: параметр izm_master_volume в аудио-железе ----
+    private var izmCur = -1                 // текущий уровень, -1 = пока неизвестен
+    private var izmLastSent = -1
+    private var izmGetWorks = true
+    private var izmGetFails = 0
+    private var izmGetResult = ""
+    private var izmLastEvent = "пока нет (нажмите кнопку громкости на плеере)"
+
+    private val izmReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, intent: Intent?) {
+            intent ?: return
+            val act = intent.action ?: ""
+            val sb = StringBuilder(act.substringAfterLast('.'))
+            try {
+                val ex = intent.extras
+                if (ex != null) {
+                    var candidate = -1
+                    for (k in ex.keySet()) {
+                        @Suppress("DEPRECATION")
+                        val v = ex.get(k)
+                        sb.append(' ').append(k).append('=').append(v)
+                        val num: Int? = when (v) {
+                            is Int -> v
+                            is Long -> v.toInt()
+                            else -> null
+                        }
+                        if (num != null && candidate < 0 &&
+                            (k.contains("volume", true) || k.contains("level", true) || k.contains("value", true))
+                        ) {
+                            candidate = num
+                        }
+                    }
+                    if (candidate >= 0 && act.endsWith("MASTER_VOLUME_CHANGED")) {
+                        izmCur = candidate.coerceIn(0, Design.IZM_MAX)
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            izmLastEvent = sb.toString()
+            syncVolumeFromSystem()
+        }
+    }
+
+    // Читаем текущий уровень у аудио-железа (если оно отвечает на такой запрос)
+    private fun pollIzmVolume(force: Boolean = false) {
+        if (!izmGetWorks && !force) return
+        try {
+            val r = audioManager.getParameters("izm_master_volume") ?: ""
+            izmGetResult = r
+            val v = r.substringAfter("izm_master_volume=", "").takeWhile { it.isDigit() }.toIntOrNull()
+            if (v != null) {
+                izmCur = v.coerceIn(0, Design.IZM_MAX)
+                izmGetFails = 0
+                izmGetWorks = true
+            } else if (++izmGetFails >= 3 && !force) {
+                izmGetWorks = false
+            }
+        } catch (e: Exception) {
+            izmGetWorks = false
+        }
+    }
+
+    private fun setIzmVolume(percent: Int) {
+        val v = (percent * Design.IZM_MAX / 100f).roundToInt().coerceIn(0, Design.IZM_MAX)
+        if (v == izmLastSent) return
+        izmLastSent = v
+        try {
+            audioManager.setParameters("izm_master_volume=$v")
+            izmCur = v
+        } catch (e: Exception) {
+        }
+    }
+
     // Громкость шагами, как это делают физические кнопки
     private fun stepSystemVolume(target: Int, viaSession: Boolean) {
         try {
@@ -960,6 +1070,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
     // Окно "Громкость": сведения и переключение способа управления
     private fun showVolumeDialog() {
+        pollIzmVolume(true)
         try {
             AlertDialog.Builder(context)
                 .setTitle("Громкость")
@@ -980,6 +1091,9 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private fun volumeDiagnostics(): String {
         val sb = StringBuilder()
         sb.append("Способ ").append(volMethodNames[volMethod]).append("\n")
+        sb.append("Sony: уровень ").append(if (izmCur >= 0) "$izmCur из ${Design.IZM_MAX}" else "неизвестен")
+            .append(", чтение: ").append(if (izmGetResult.isBlank()) "нет ответа" else izmGetResult)
+            .append("\nСобытие Sony: ").append(izmLastEvent).append("\n")
         try {
             val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -1620,7 +1734,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
         // потом проверяем, что включилась нужная песня
         val from = activeIndex()
         if (from >= 0 && from != index) {
-            stepToTrack(index - from, item)
+            stepToTrack(item)
         } else if (from < 0) {
             playByUri(item)
         }
@@ -1635,23 +1749,62 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
     }
 
-    private fun stepToTrack(diff: Int, target: TrackItem) {
-        if (diff == 0) return
-        val tc = WalkmanNotificationListener.activeController?.transportControls ?: return
-        var left = abs(diff).coerceAtMost(60)
-        val forward = diff > 0
-        val r = object : Runnable {
-            override fun run() {
-                if (left <= 0) {
-                    mainHandler.postDelayed({ verifyLanded(target) }, 900L)
+    // Переход на выбранную песню шагами "вперёд/назад". После каждого шага смотрим,
+    // какая песня играет на самом деле, и только потом делаем следующий.
+    private var stepTarget: TrackItem? = null
+    private var stepIdxAtIssue = -2
+    private var stepIssuedAt = 0L
+    private var stepCount = 0
+
+    private val stepRunnable = object : Runnable {
+        override fun run() {
+            val target = stepTarget ?: return
+            if (!isAttachedToWindow) {
+                stepTarget = null
+                return
+            }
+            val targetIdx = tracks.indexOfFirst { it.title == target.title && it.trackNo == target.trackNo }
+            val cur = activeIndex()
+            if (targetIdx < 0 || cur < 0 || cur == targetIdx || stepCount >= 80) {
+                finishStepping(target)
+                return
+            }
+            // После шага номер песни должен сдвинуться ровно на 1. Иначе это shuffle или сбой.
+            if (stepIdxAtIssue >= 0 && cur != stepIdxAtIssue && abs(cur - stepIdxAtIssue) != 1) {
+                Toast.makeText(context, "Порядок треков не совпал. Выключен ли shuffle в плеере?", Toast.LENGTH_LONG).show()
+                finishStepping(null)
+                return
+            }
+            // Ждём, пока плеер переключится после прошлого шага (но не дольше 1,2 секунды:
+            // кнопка "назад" может просто начать текущую песню заново)
+            val waiting = cur == stepIdxAtIssue && SystemClock.uptimeMillis() - stepIssuedAt < 1200L
+            if (!waiting) {
+                val tc = WalkmanNotificationListener.activeController?.transportControls
+                if (tc == null) {
+                    finishStepping(null)
                     return
                 }
-                left--
-                if (forward) tc.skipToNext() else tc.skipToPrevious()
-                mainHandler.postDelayed(this, 250L)
+                if (targetIdx > cur) tc.skipToNext() else tc.skipToPrevious()
+                stepIdxAtIssue = cur
+                stepIssuedAt = SystemClock.uptimeMillis()
+                stepCount++
             }
+            mainHandler.postDelayed(this, 120L)
         }
-        r.run()
+    }
+
+    private fun stepToTrack(target: TrackItem) {
+        stepTarget = target
+        stepIdxAtIssue = -2
+        stepCount = 0
+        mainHandler.removeCallbacks(stepRunnable)
+        stepRunnable.run()
+    }
+
+    private fun finishStepping(verify: TrackItem?) {
+        stepTarget = null
+        mainHandler.removeCallbacks(stepRunnable)
+        if (verify != null) mainHandler.postDelayed({ verifyLanded(verify) }, 900L)
     }
 
     // Если после перелистывания играет не та песня, пробуем включить её по адресу файла

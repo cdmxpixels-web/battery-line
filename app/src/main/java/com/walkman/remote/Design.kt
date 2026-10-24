@@ -127,9 +127,30 @@ object Design {
     const val DISC_FLIP_MS = 1050L         // оборот диска при смене трека
 
     // ---- Переход на выбранную песню в списке ----
-    const val STEP_LOOKAHEAD = 4           // сколько команд "вперёд/назад" можно слать наперёд
-    const val STEP_GAP_MS = 60L            // минимальная пауза между командами
+    const val STEP_LOOKAHEAD = 3           // сколько команд "вперёд/назад" можно слать наперёд
+    const val STEP_GAP_MS = 80L            // минимальная пауза между командами
     const val STEP_TICK_MS = 25L           // как часто проверяем, что играет
     const val STEP_STALL_MS = 1000L        // если за это время ничего не сменилось, досылаем шаги
+    const val STEP_SETTLE_MS = 800L        // после прихода на нужную песню ещё следим и поправляем
     const val PREV_RESTART_MS = 3000L      // "назад" позже этого времени лишь начинает песню заново
+
+    // ---- Экран выбора акцентного цвета ----
+    val COLOR_PALETTE: IntArray = intArrayOf(
+        0xFFF13F2B.toInt(), 0xFF2D4EE2.toInt(),
+        0xFF5AA498.toInt(), 0xFFCC8E32.toInt(),
+        0xFFBB628C.toInt(), 0xFF707579.toInt(),
+        0xFF098F0B.toInt(), 0xFF873DE7.toInt()
+    )
+    val COLOR_X = floatArrayOf(214.5f, 505.5f)                      // центры кругов по горизонтали
+    val COLOR_Y = floatArrayOf(203.5f, 494.5f, 785.5f, 1076.5f)     // и по вертикали
+    const val COLOR_R = 136.5f
+    const val COLOR_C_DX = -112f   // буква "C" у выбранного цвета: сдвиг от центра круга
+    const val COLOR_C_DY = 9f
+    val COLOR_LINES = arrayOf(
+        floatArrayOf(118f, 298f, 310f, 106f),
+        floatArrayOf(118f, 590f, 602f, 106f),
+        floatArrayOf(118f, 882f, 602f, 398f),
+        floatArrayOf(118f, 1172f, 602f, 688f),
+        floatArrayOf(409f, 1172f, 601f, 981f)
+    )
 }

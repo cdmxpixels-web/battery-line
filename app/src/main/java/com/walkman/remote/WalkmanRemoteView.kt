@@ -6,7 +6,6 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -39,9 +38,6 @@ import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.animation.DecelerateInterpolator
-import android.widget.LinearLayout
-import android.widget.SeekBar
-import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
 import kotlin.math.abs
@@ -189,6 +185,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // Список треков: состояние
     // ------------------------------------------------------------------
     private var sheetVisible = false
+    private var colorScreen = false          // экран выбора акцентного цвета
     private var sheetY = Design.H            // 0 = экран открыт, H = спрятан внизу
     private var sheetX = 0f                  // сдвиг вправо при закрытии смахиванием вбок
     private var sheetAnimator: ValueAnimator? = null
@@ -600,6 +597,12 @@ class WalkmanRemoteView(context: Context) : View(context) {
         accentPaint.color = accentColor
         updateTimeStrings()
 
+        if (colorScreen) {
+            drawColorScreen(canvas)
+            canvas.restore()
+            return
+        }
+
         // Когда список закрывает весь экран, главный экран под ним не рисуем
         if (!(sheetVisible && sheetY <= 0f && sheetX <= 0f)) {
             drawTopRow(canvas)
@@ -742,6 +745,10 @@ class WalkmanRemoteView(context: Context) : View(context) {
         val x = event.x * Design.W / width
         val y = event.y * Design.H / height
 
+        if (colorScreen) {
+            if (event.actionMasked == MotionEvent.ACTION_UP) onColorTap(x, y)
+            return true
+        }
         if (sheetVisible) return handleSheetTouch(event, x, y)
 
         when (event.actionMasked) {
@@ -809,7 +816,8 @@ class WalkmanRemoteView(context: Context) : View(context) {
         }
 
         // Громкость
-        if (y > Design.TITLE_BOTTOM && hypot(x - Design.VOL_CX, y - Design.VOL_CY) <= Design.VOL_R + 1f) {
+        val dVol = hypot(x - Design.VOL_CX, y - Design.VOL_CY)
+        if (y > Design.TITLE_BOTTOM && dVol <= Design.VOL_R + 1f && dVol >= Design.VOL_INNER_R) {
             mode = Mode.VOLUME
             volStartProgress = volumeProgress(x, y)
             // Уровень Sony пока неизвестен: считаем от нуля (так громче, чем было, не станет)
@@ -886,7 +894,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
 
             Mode.COLOR -> {
                 if (!cancelled && hypot(x - Design.C_CX, y - Design.C_CY) <= Design.C_R + 12f) {
-                    showColorPickerDialog()
+                    colorScreen = true
                 }
             }
 
@@ -1002,6 +1010,11 @@ class WalkmanRemoteView(context: Context) : View(context) {
     // Список треков: данные
     // ------------------------------------------------------------------
     fun handleBack(): Boolean {
+        if (colorScreen) {
+            colorScreen = false
+            invalidate()
+            return true
+        }
         if (!sheetVisible) return false
         closeSheet()
         return true
@@ -1572,6 +1585,7 @@ class WalkmanRemoteView(context: Context) : View(context) {
     private var stepLastIssueAt = 0L
     private var stepLastChangeAt = 0L
     private var stepLastCur = -1
+    private var stepArrivedAt = 0L
 
     private fun planSteps(cur: Int, targetIdx: Int) {
         stepStartIdx = cur
@@ -1611,10 +1625,19 @@ class WalkmanRemoteView(context: Context) : View(context) {
                 stepLastChangeAt = now
             }
             if (cur == targetIdx) {
-                stepTarget = null
-                if (!isPlaying) tc.play()
+                // Дошли. Ещё немного следим: если запоздавшая команда сдвинет трек, поправим
+                if (stepArrivedAt == 0L) {
+                    stepArrivedAt = now
+                    if (!isPlaying) tc.play()
+                }
+                if (now - stepArrivedAt >= Design.STEP_SETTLE_MS) {
+                    stepTarget = null
+                    return
+                }
+                mainHandler.postDelayed(this, Design.STEP_TICK_MS)
                 return
             }
+            stepArrivedAt = 0L
 
             var progress = (cur - stepStartIdx) * stepDir
             var inFlight = (stepIssued - progress - stepRestart).coerceAtLeast(0)
@@ -1651,68 +1674,42 @@ class WalkmanRemoteView(context: Context) : View(context) {
         stepLastCur = from
         stepPlans = 0
         stepLastIssueAt = 0L
+        stepArrivedAt = 0L
         planSteps(from, targetIdx)
         mainHandler.removeCallbacks(stepRunnable)
         stepRunnable.run()
     }
 
     // ------------------------------------------------------------------
-    // Выбор акцентного цвета
+    // Экран выбора акцентного цвета
     // ------------------------------------------------------------------
-    private fun showColorPickerDialog() {
-        val layout = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(50, 40, 50, 20)
-            setBackgroundColor(Color.parseColor("#1A1A1A"))
-        }
+    private fun colorCenterX(i: Int): Float = Design.COLOR_X[i % 2]
+    private fun colorCenterY(i: Int): Float = Design.COLOR_Y[i / 2]
 
-        val rgb = intArrayOf(Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
-
-        val preview = View(context).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 80)
-            setBackgroundColor(accentColor)
-        }
-        layout.addView(preview)
-
-        fun addChannelSlider(label: String, index: Int) {
-            val text = TextView(context).apply {
-                this.text = "$label: ${rgb[index]}"
-                setTextColor(Color.WHITE)
-                typeface = monoFace
-                setPadding(0, 20, 0, 5)
+    private fun drawColorScreen(canvas: Canvas) {
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        for (i in Design.COLOR_PALETTE.indices) {
+            val cx = colorCenterX(i)
+            val cy = colorCenterY(i)
+            p.color = Design.COLOR_PALETTE[i]
+            canvas.drawCircle(cx, cy, Design.COLOR_R, p)
+            if (Design.COLOR_PALETTE[i] == accentColor) {
+                canvas.drawText("C", cx + Design.COLOR_C_DX, cy + Design.COLOR_C_DY, monoPaint)
             }
-            layout.addView(text)
-
-            val seek = SeekBar(context).apply {
-                max = 255
-                progress = rgb[index]
-                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                        rgb[index] = p
-                        text.text = "$label: $p"
-                        preview.setBackgroundColor(Color.rgb(rgb[0], rgb[1], rgb[2]))
-                    }
-
-                    override fun onStartTrackingTouch(s: SeekBar?) {}
-                    override fun onStopTrackingTouch(s: SeekBar?) {}
-                })
-            }
-            layout.addView(seek)
         }
+        // Декоративные диагональные линии
+        for (l in Design.COLOR_LINES) canvas.drawLine(l[0], l[1], l[2], l[3], linePaint)
+    }
 
-        addChannelSlider("R", 0)
-        addChannelSlider("G", 1)
-        addChannelSlider("B", 2)
-
-        AlertDialog.Builder(context)
-            .setTitle("Accent Color")
-            .setView(layout)
-            .setPositiveButton("OK") { _, _ ->
-                accentColor = Color.rgb(rgb[0], rgb[1], rgb[2])
+    private fun onColorTap(x: Float, y: Float) {
+        for (i in Design.COLOR_PALETTE.indices) {
+            if (hypot(x - colorCenterX(i), y - colorCenterY(i)) <= Design.COLOR_R) {
+                accentColor = Design.COLOR_PALETTE[i]
                 prefs.edit().putInt("accent_color", accentColor).apply()
+                colorScreen = false
                 invalidate()
+                return
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+        }
     }
 }
